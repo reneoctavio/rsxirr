@@ -6,3 +6,5 @@ __pycache__
 .pyodide-xbuildenv
 .idea/*
 .vscode/*
+.venv
+.devbox
