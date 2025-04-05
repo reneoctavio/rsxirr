@@ -309,3 +309,63 @@ pub fn mirr(
 
     Ok((positive / -negative).powf(1.0 / (values.len() - 1) as f64) - 1.0)
 }
+
+/// Calculates the cumulative principal payment between start_period and end_period
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value
+/// * `start_period` - First period in the calculation
+/// * `end_period` - Last period in the calculation
+/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+///
+/// # Returns
+///
+/// * `Option<f64>` - The cumulative principal payment, or None if calculation fails
+pub fn cumprinc(
+    rate: f64,
+    nper: f64,
+    pv: f64,
+    start_period: f64,
+    end_period: f64,
+    pmt_at_beginning: bool,
+) -> f64 {
+    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMPRINC
+    let result = (start_period.trunc() as u64..=end_period.trunc() as u64)
+        .filter_map(|per| Some(ppmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning)))
+        .sum();
+
+    result
+}
+
+/// Calculates the cumulative interest payment between start_period and end_period
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value
+/// * `start_period` - First period in the calculation
+/// * `end_period` - Last period in the calculation
+/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+///
+/// # Returns
+///
+/// * `f64` - The cumulative interest payment
+pub fn cumipmt(
+    rate: f64,
+    nper: f64,
+    pv: f64,
+    start_period: f64,
+    end_period: f64,
+    pmt_at_beginning: bool,
+) -> f64 {
+    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMIPMT
+    let result = (start_period.trunc() as u64..=end_period.trunc() as u64)
+        .filter_map(|per| Some(ipmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning)))
+        .sum();
+
+    result
+}
