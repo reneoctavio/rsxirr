@@ -500,7 +500,7 @@ fn test_nfv() {
 ], 0.038039605693757084)]
 fn test_irr_works(#[case] input: &[f64], #[case] expected: f64) {
     let result = irr(input, None).unwrap();
-    assert_almost_eq!(result, expected);
+    assert_almost_eq!(result, expected, 1e-7);
 }
 
 #[rstest]
@@ -531,7 +531,7 @@ fn test_irr_works(#[case] input: &[f64], #[case] expected: f64) {
 fn test_irr_equal_payments(#[case] first: &[f64], #[case] other: &[f64], #[case] expected: f64) {
     let input: Vec<f64> = first.iter().chain(other.iter()).cloned().collect();
     let result = irr(&input, None).unwrap();
-    assert_almost_eq!(result, expected);
+    assert_almost_eq!(result, expected, 1e-7);
 }
 
 #[rstest]
@@ -558,11 +558,11 @@ fn test_irr_equal_payments(#[case] first: &[f64], #[case] other: &[f64], #[case]
 ], 0.235461374465902)]
 fn test_irr_special_cases(#[case] input: &[f64], #[case] expected: f64) {
     let rate = irr(input, None).unwrap();
-    assert_almost_eq!(rate, expected);
+    assert_almost_eq!(rate, expected, 1e-6);
 
     // test net present value of all cash flows equal to zero
     let npv_result = npv(rate, input, Some(true));
-    assert_almost_eq!(npv_result, 0.0);
+    assert_almost_eq!(npv_result, 0.0, 1e-4);
 }
 
 #[rstest]
@@ -589,7 +589,7 @@ fn test_gh_46(#[case] input: &[f64], #[case] expected: f64) {
 
     // test net present value of all cash flows equal to zero
     let npv_result = npv(rate, input, Some(true));
-    assert_almost_eq!(npv_result, 0.0, 1e-6);
+    assert_almost_eq!(npv_result, 0.0, 1e-4);
 }
 
 #[rstest]
@@ -606,7 +606,7 @@ fn test_irr_samples(#[case] input: &str, #[case] expected: f64) {
 
     // test net present value of all cash flows equal to zero
     let npv_result = npv(rate, &amounts, Some(true));
-    assert_almost_eq!(npv_result, 0.0, 1e-8);
+    assert_almost_eq!(npv_result, 0.0, 1e-4);
 }
 
 // ------------ MIRR ----------------

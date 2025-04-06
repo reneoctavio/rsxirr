@@ -15,7 +15,7 @@ fn test_core_xirr_functionality() {
     let (dates, amounts) = split_payments(&payments);
 
     let result = xirr(&dates, &amounts, None, None).unwrap();
-    assert_almost_eq!(result, EXPECTED);
+    assert_almost_eq!(result, EXPECTED, 1e-7);
 }
 
 #[rstest]

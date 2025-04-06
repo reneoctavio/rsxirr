@@ -1,5 +1,5 @@
-const MAX_ERROR: f64 = 1e-9;
-const MAX_ITERATIONS: u32 = 50;
+const MAX_ERROR: f64 = 1e-7;
+const MAX_ITERATIONS: u32 = 20;
 const MAX_FX_TOL: f64 = 1e-3;
 
 pub fn newton_raphson<Func, Deriv>(start: f64, f: &Func, d: &Deriv) -> f64
@@ -43,12 +43,24 @@ where
     for _ in 0..MAX_ITERATIONS {
         let (y0, y1) = fd(x);
 
+        // Fast path: already close enough
         if y0.abs() < MAX_ERROR {
             return x;
         }
 
+        // Check for nearly-zero derivative to avoid division issues
+        if y1.abs() < 1e-14 {
+            // Either we're at an inflection point or have numerical issues
+            return if y0.abs() < MAX_FX_TOL {
+                x
+            } else {
+                f64::NAN
+            };
+        }
+
         let delta = y0 / y1;
 
+        // Early convergence detection
         if delta.abs() < MAX_ERROR && y0.abs() < MAX_FX_TOL {
             return x;
         }

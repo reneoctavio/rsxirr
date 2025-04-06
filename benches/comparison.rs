@@ -12,6 +12,7 @@ fn bench_xirr_by_size(c: &mut Criterion) {
         ("xirr_100", "tests/samples/rw-100.csv"),
         ("xirr_500", "tests/samples/rw-500.csv"),
         ("xirr_1000", "tests/samples/rw-1000.csv"),
+        ("xirr_orbit_001", "tests/samples/orbit-001.csv"),
     ];
 
     for (name, file) in files.iter() {
@@ -40,6 +41,7 @@ fn bench_irr_by_size(c: &mut Criterion) {
         ("irr_100", "tests/samples/rw-100.csv"),
         ("irr_500", "tests/samples/rw-500.csv"),
         ("irr_1000", "tests/samples/rw-1000.csv"),
+        ("irr_orbit_001", "tests/samples/orbit-001.csv"),
     ];
 
     for (name, file) in files.iter() {

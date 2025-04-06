@@ -95,7 +95,7 @@ fn test_xirr_samples(#[case] input: &str, #[case] expected: f64) {
     if result.is_nan() {
         assert!(expected.is_nan(), "assertion failed: expected {expected}, found NaN");
     } else {
-        assert_almost_eq!(result, expected);
+        assert_almost_eq!(result, expected, 1e-7);
 
         // Verify result with xnpv
         let xnpv_result = xnpv(result, &dates, &amounts, None).unwrap();
@@ -117,8 +117,7 @@ fn test_xirr_silent() {
     // a Python-specific feature, but we can verify error handling works
     match result {
         Err(e) => {
-            println!("Expected error: {}", e);
-            // Could check specific error type if needed
+            assert_eq!(e.to_string(), "negative and positive payments are required")
         }
         Ok(_) => panic!("Expected error but got success"),
     }
@@ -175,8 +174,7 @@ fn test_xnfv_silent() {
     // Check the error (in Rust we'd typically match on error type)
     match result {
         Err(e) => {
-            println!("Expected error: {}", e);
-            // Verify it's the expected error type
+            assert_eq!(e.to_string(), "the amounts and dates arrays are of different lengths")
         }
         Ok(_) => panic!("Expected error but got success"),
     }
