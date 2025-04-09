@@ -1,0 +1,697 @@
+/// Trait to abstract SIMD operations for different architectures
+trait SimdOps {
+    /// Process a chunk of data for NPV calculation
+    unsafe fn process_npv_chunk(
+        base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+    ) -> (f64, f64); // returns (sum, new_power)
+
+    /// Process a chunk for NPV with derivative calculation
+    unsafe fn process_npv_deriv_chunk(
+        base: f64,
+        inv_base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+        start_index: usize,
+    ) -> (f64, f64, f64); // returns (sum, deriv, new_power)
+
+    /// Get chunk size for processing
+    fn chunk_size() -> usize;
+
+    /// Get precomputed power for updating between chunks
+    unsafe fn precompute_power_factor(base: f64) -> f64;
+
+    /// Check if this implementation is supported on current CPU
+    fn is_supported() -> bool;
+}
+
+/// AVX implementation
+#[cfg(target_arch = "x86_64")]
+struct AvxOps;
+
+#[cfg(target_arch = "x86_64")]
+impl SimdOps for AvxOps {
+    #[target_feature(enable = "avx")]
+    unsafe fn process_npv_chunk(
+        base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+    ) -> (f64, f64) {
+        use std::arch::x86_64::*;
+
+        // Prefetch next chunk for better memory performance
+        if start_idx + 8 < values.len() {
+            _mm_prefetch::<_MM_HINT_T0>(values.as_ptr().add(start_idx + 8) as *const i8);
+        }
+
+        let vec_base = _mm256_set1_pd(base);
+        let vec_power_base = _mm256_set1_pd(power);
+
+        // Create multipliers [1, base, base^2, base^3] more efficiently
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base_cubed = _mm256_mul_pd(vec_base_squared, vec_base);
+        let vec_mult = _mm256_set_pd(
+            _mm256_cvtsd_f64(vec_base_cubed),
+            _mm256_cvtsd_f64(vec_base_squared),
+            base,
+            1.0,
+        );
+
+        // Multiply to get powers
+        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
+
+        // Alignment-aware load
+        let vec_values = if (values.as_ptr() as usize + start_idx * 8) % 32 == 0 {
+            _mm256_load_pd(&values[start_idx])
+        } else {
+            _mm256_loadu_pd(&values[start_idx])
+        };
+
+        // Divide values by powers
+        let vec_result = _mm256_div_pd(vec_values, vec_power);
+
+        // // Use horizontal add to sum up the 4 packed doubles:
+        // let hadd = _mm256_hadd_pd(vec_result, vec_result);
+        // let low128 = _mm256_castpd256_pd128(hadd);
+        // let high128 = _mm256_extractf128_pd(hadd, 1);
+        // let sum128 = _mm_add_pd(low128, high128);
+        // let sum = _mm_cvtsd_f64(sum128);
+
+        // Sum the results
+        let mut result_array = [0.0; 4];
+        _mm256_storeu_pd(result_array.as_mut_ptr(), vec_result);
+        let sum = result_array.iter().sum::<f64>();
+
+        // Return sum and updated power
+        (sum, power * Self::precompute_power_factor(base))
+    }
+
+    #[target_feature(enable = "avx")]
+    unsafe fn process_npv_deriv_chunk(
+        base: f64,
+        inv_base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+        start_index: usize,
+    ) -> (f64, f64, f64) {
+        use std::arch::x86_64::*;
+
+        // Prefetch next chunk
+        if start_idx + 8 < values.len() {
+            _mm_prefetch::<_MM_HINT_T0>(values.as_ptr().add(start_idx + 8) as *const i8);
+        }
+
+        let vec_base = _mm256_set1_pd(base);
+        let vec_power_base = _mm256_set1_pd(power);
+        let vec_inv_base = _mm256_set1_pd(inv_base);
+        let vec_neg_one = _mm256_set1_pd(-1.0);
+
+        // More efficient power calculation
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base_cubed = _mm256_mul_pd(vec_base_squared, vec_base);
+        let vec_mult = _mm256_set_pd(
+            _mm256_cvtsd_f64(vec_base_cubed),
+            _mm256_cvtsd_f64(vec_base_squared),
+            base,
+            1.0,
+        );
+
+        // Multiply to get powers
+        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
+
+        // Alignment-aware load
+        let vec_values = if (values.as_ptr() as usize + start_idx * 8) % 32 == 0 {
+            _mm256_load_pd(&values[start_idx])
+        } else {
+            _mm256_loadu_pd(&values[start_idx])
+        };
+
+        // More efficient index vector creation
+        let offset = start_index + start_idx;
+        let vec_indices = _mm256_set_pd(
+            (offset + 3) as f64,
+            (offset + 2) as f64,
+            (offset + 1) as f64,
+            offset as f64,
+        );
+
+        // Calculate terms
+        let vec_term = _mm256_div_pd(vec_values, vec_power);
+
+        // Combined calculation for derivative terms
+        let vec_deriv = _mm256_mul_pd(
+            _mm256_mul_pd(_mm256_mul_pd(vec_indices, vec_term), vec_inv_base),
+            vec_neg_one,
+        );
+
+        // Store results
+        let mut term_array = [0.0; 4];
+        let mut deriv_array = [0.0; 4];
+        _mm256_storeu_pd(term_array.as_mut_ptr(), vec_term);
+        _mm256_storeu_pd(deriv_array.as_mut_ptr(), vec_deriv);
+
+        let sum = term_array.iter().sum::<f64>();
+        let deriv = deriv_array.iter().sum::<f64>();
+
+        (sum, deriv, power * Self::precompute_power_factor(base))
+    }
+
+    fn chunk_size() -> usize {
+        4
+    }
+
+    #[target_feature(enable = "avx")]
+    unsafe fn precompute_power_factor(base: f64) -> f64 {
+        use std::arch::x86_64::*;
+        let vec_base = _mm256_set1_pd(base);
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base4 = _mm256_mul_pd(vec_base_squared, vec_base_squared);
+        _mm256_cvtsd_f64(vec_base4)
+    }
+
+    fn is_supported() -> bool {
+        is_x86_feature_detected!("avx")
+    }
+}
+
+/// AVX2+FMA implementation
+#[cfg(target_arch = "x86_64")]
+struct Avx2Ops;
+
+#[cfg(target_arch = "x86_64")]
+impl SimdOps for Avx2Ops {
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn process_npv_chunk(
+        base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+    ) -> (f64, f64) {
+        use std::arch::x86_64::*;
+
+        // Prefetch next chunk for better memory performance
+        if start_idx + 8 < values.len() {
+            _mm_prefetch::<_MM_HINT_T0>(values.as_ptr().add(start_idx + 8) as *const i8);
+        }
+
+        let vec_base = _mm256_set1_pd(base);
+        let vec_power_base = _mm256_set1_pd(power);
+
+        // More efficient power calculation with FMA
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base_cubed = _mm256_fmadd_pd(vec_base, vec_base_squared, _mm256_setzero_pd());
+
+        // Set up multipliers more efficiently
+        let vec_mult = _mm256_set_pd(
+            _mm_cvtsd_f64(_mm256_castpd256_pd128(vec_base_cubed)),
+            _mm_cvtsd_f64(_mm256_castpd256_pd128(vec_base_squared)),
+            base,
+            1.0,
+        );
+
+        // Use FMA for power calculation
+        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
+
+        // Load values - check if we can use aligned load
+        let vec_values = if (values.as_ptr() as usize + start_idx * 8) % 32 == 0 {
+            _mm256_load_pd(&values[start_idx])
+        } else {
+            _mm256_loadu_pd(&values[start_idx])
+        };
+
+        let vec_result = _mm256_div_pd(vec_values, vec_power);
+
+        // Sum the results
+        let mut result_array = [0.0; 4];
+        _mm256_storeu_pd(result_array.as_mut_ptr(), vec_result);
+        let sum = result_array.iter().sum::<f64>();
+
+        (sum, power * Self::precompute_power_factor(base))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn process_npv_deriv_chunk(
+        base: f64,
+        inv_base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+        start_index: usize,
+    ) -> (f64, f64, f64) {
+        use std::arch::x86_64::*;
+
+        // Prefetch next chunk
+        if start_idx + 8 < values.len() {
+            _mm_prefetch::<_MM_HINT_T0>(values.as_ptr().add(start_idx + 8) as *const i8);
+        }
+
+        let vec_base = _mm256_set1_pd(base);
+        let vec_power_base = _mm256_set1_pd(power);
+        let vec_inv_base = _mm256_set1_pd(inv_base);
+
+        // More efficient power calculation with FMA
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base_cubed = _mm256_fmadd_pd(vec_base, vec_base_squared, _mm256_setzero_pd());
+
+        // Set up multipliers
+        let vec_mult = _mm256_set_pd(
+            _mm_cvtsd_f64(_mm256_castpd256_pd128(vec_base_cubed)),
+            _mm_cvtsd_f64(_mm256_castpd256_pd128(vec_base_squared)),
+            base,
+            1.0,
+        );
+
+        // Use FMA where applicable
+        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
+
+        // Optimized value loading
+        let vec_values = if (values.as_ptr() as usize + start_idx * 8) % 32 == 0 {
+            _mm256_load_pd(&values[start_idx])
+        } else {
+            _mm256_loadu_pd(&values[start_idx])
+        };
+
+        // Create index vector for derivative - using direct set rather than repeated conversions
+        let offset = start_index + start_idx;
+        let vec_indices = _mm256_set_pd(
+            (offset + 3) as f64,
+            (offset + 2) as f64,
+            (offset + 1) as f64,
+            offset as f64,
+        );
+
+        // Calculate NPV terms
+        let vec_term = _mm256_div_pd(vec_values, vec_power);
+
+        // Use FMA to optimize derivative calculation
+        let vec_deriv = _mm256_mul_pd(vec_indices, vec_term);
+        let vec_deriv = _mm256_fnmadd_pd(vec_deriv, vec_inv_base, _mm256_setzero_pd());
+
+        // Store results
+        let mut term_array = [0.0; 4];
+        let mut deriv_array = [0.0; 4];
+        _mm256_storeu_pd(term_array.as_mut_ptr(), vec_term);
+        _mm256_storeu_pd(deriv_array.as_mut_ptr(), vec_deriv);
+
+        let sum = term_array.iter().sum::<f64>();
+        let deriv = deriv_array.iter().sum::<f64>();
+
+        (sum, deriv, power * Self::precompute_power_factor(base))
+    }
+
+    fn chunk_size() -> usize {
+        4
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn precompute_power_factor(base: f64) -> f64 {
+        use std::arch::x86_64::*;
+        let vec_base = _mm256_set1_pd(base);
+        let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
+        let vec_base4 = _mm256_fmadd_pd(vec_base_squared, vec_base_squared, _mm256_setzero_pd());
+        _mm_cvtsd_f64(_mm256_castpd256_pd128(vec_base4))
+    }
+
+    fn is_supported() -> bool {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    }
+}
+
+/// NEON implementation for ARM
+#[cfg(target_arch = "aarch64")]
+struct NeonOps;
+
+#[cfg(target_arch = "aarch64")]
+impl SimdOps for NeonOps {
+    unsafe fn process_npv_chunk(
+        base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+    ) -> (f64, f64) {
+        use std::arch::aarch64::*;
+
+        let vec_base = vdupq_n_f64(base);
+        let vec_power_base = vdupq_n_f64(power);
+
+        // Create multipliers [1, base]
+        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
+
+        // Multiply to get powers
+        let vec_power = vmulq_f64(vec_power_base, vec_mult);
+
+        // Load values
+        let vec_values = vld1q_f64(&values[start_idx]);
+
+        // Divide values by powers
+        let vec_result = vdivq_f64(vec_values, vec_power);
+
+        // Sum the results
+        let mut result_array = [0.0; 2];
+        vst1q_f64(result_array.as_mut_ptr(), vec_result);
+        let sum = result_array.iter().sum::<f64>();
+
+        // Return sum and updated power
+        (sum, power * Self::precompute_power_factor(base))
+    }
+
+    unsafe fn process_npv_deriv_chunk(
+        base: f64,
+        inv_base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+        start_index: usize,
+    ) -> (f64, f64, f64) {
+        use std::arch::aarch64::*;
+
+        let vec_base = vdupq_n_f64(base);
+        let vec_power_base = vdupq_n_f64(power);
+        let vec_inv_base = vdupq_n_f64(inv_base);
+        let vec_neg_one = vdupq_n_f64(-1.0);
+
+        // Create multipliers [1, base]
+        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
+
+        // Multiply to get powers
+        let vec_power = vmulq_f64(vec_power_base, vec_mult);
+
+        // Load values
+        let vec_values = vld1q_f64(&values[start_idx]);
+
+        // Create index vector for derivative
+        let vec_indices = vcombine_f64(
+            vdup_n_f64((start_index + start_idx) as f64),
+            vdup_n_f64((start_index + start_idx + 1) as f64),
+        );
+
+        // Calculate terms
+        let vec_term = vdivq_f64(vec_values, vec_power);
+
+        // Calculate derivative terms
+        let vec_deriv = vmulq_f64(vec_indices, vec_term);
+        let vec_deriv = vmulq_f64(vec_deriv, vec_inv_base);
+        let vec_deriv = vmulq_f64(vec_deriv, vec_neg_one);
+
+        // Store results
+        let mut term_array = [0.0; 2];
+        let mut deriv_array = [0.0; 2];
+        vst1q_f64(term_array.as_mut_ptr(), vec_term);
+        vst1q_f64(deriv_array.as_mut_ptr(), vec_deriv);
+
+        let sum = term_array.iter().sum::<f64>();
+        let deriv = deriv_array.iter().sum::<f64>();
+
+        (sum, deriv, power * Self::precompute_power_factor(base))
+    }
+
+    fn chunk_size() -> usize {
+        2
+    }
+
+    unsafe fn precompute_power_factor(base: f64) -> f64 {
+        use std::arch::aarch64::*;
+        let vec_base = vdupq_n_f64(base);
+        let vec_base_squared = vmulq_f64(vec_base, vec_base);
+        vgetq_lane_f64(vec_base_squared, 0)
+    }
+
+    fn is_supported() -> bool {
+        true
+    }
+}
+
+/// Auto-vectorized implementation
+struct AutoVecOps;
+
+impl SimdOps for AutoVecOps {
+    unsafe fn process_npv_chunk(
+        base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+    ) -> (f64, f64) {
+        // Using a pattern that's friendly for auto-vectorization
+        const CHUNK: usize = 4;
+        let mut accum = 0.0;
+        let mut powers = [0.0; CHUNK];
+
+        // Initialize powers for this chunk
+        powers[0] = power;
+        for i in 1..CHUNK {
+            powers[i] = powers[i - 1] * base;
+        }
+
+        // Process values
+        for i in 0..CHUNK {
+            accum += values[start_idx + i] / powers[i];
+        }
+
+        // Return sum and updated power for next chunk
+        (accum, powers[CHUNK - 1] * base)
+    }
+
+    unsafe fn process_npv_deriv_chunk(
+        base: f64,
+        inv_base: f64,
+        values: &[f64],
+        start_idx: usize,
+        power: f64,
+        start_index: usize,
+    ) -> (f64, f64, f64) {
+        const CHUNK: usize = 4;
+        let mut sum_accum = 0.0;
+        let mut deriv_accum = 0.0;
+        let mut powers = [0.0; CHUNK];
+
+        // Initialize powers for this chunk
+        powers[0] = power;
+        for i in 1..CHUNK {
+            powers[i] = powers[i - 1] * base;
+        }
+
+        // Process values - compute sum and derivative
+        for i in 0..CHUNK {
+            let idx = start_idx + i;
+            let term = values[idx] / powers[i];
+            sum_accum += term;
+            deriv_accum -= (start_index + idx) as f64 * term * inv_base;
+        }
+
+        // Return sum, derivative and updated power for next chunk
+        (sum_accum, deriv_accum, powers[CHUNK - 1] * base)
+    }
+
+    fn chunk_size() -> usize {
+        4
+    }
+
+    unsafe fn precompute_power_factor(base: f64) -> f64 {
+        base * base * base * base // base^4
+    }
+
+    fn is_supported() -> bool {
+        true
+    }
+}
+
+/// Generic NPV calculation using SIMD operations
+#[inline]
+unsafe fn npv_simd_generic<S: SimdOps>(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
+    let mut sum = 0.0;
+    let mut power = if start_from_zero {
+        1.0
+    } else {
+        base
+    };
+
+    let chunk_size = S::chunk_size();
+    let simd_limit = (values.len() / chunk_size) * chunk_size;
+
+    // Process chunks
+    for i in (0..simd_limit).step_by(chunk_size) {
+        let (chunk_sum, new_power) = S::process_npv_chunk(base, values, i, power);
+        sum += chunk_sum;
+        power = new_power;
+    }
+
+    // Process remaining elements
+    for &value in &values[simd_limit..] {
+        sum += value / power;
+        power *= base;
+    }
+
+    sum
+}
+
+/// Generic NPV with derivative calculation
+#[inline]
+unsafe fn npv_with_deriv_generic<S: SimdOps>(
+    rate: f64,
+    values: &[f64],
+    start_index: usize,
+) -> (f64, f64) {
+    let base = 1.0 + rate;
+    let inv_base = 1.0 / base;
+
+    let mut sum = 0.0;
+    let mut deriv = 0.0;
+    let mut power = base;
+
+    let chunk_size = S::chunk_size();
+    let simd_limit = (values.len() / chunk_size) * chunk_size;
+
+    // Process chunks
+    for chunk_idx in 0..(simd_limit / chunk_size) {
+        let idx = chunk_idx * chunk_size;
+        let (chunk_sum, chunk_deriv, new_power) =
+            S::process_npv_deriv_chunk(base, inv_base, values, idx, power, start_index);
+
+        sum += chunk_sum;
+        deriv += chunk_deriv;
+        power = new_power;
+    }
+
+    // Process remaining elements
+    for (i, &value) in values[simd_limit..].iter().enumerate() {
+        let term = value / power;
+        sum += term;
+        let index = start_index + simd_limit + i;
+        deriv -= (index as f64) * term * inv_base;
+        power *= base;
+    }
+
+    (sum, deriv)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn npv_simd_avx(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
+    npv_simd_generic::<AvxOps>(base, values, start_from_zero)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn npv_simd_avx2(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
+    npv_simd_generic::<Avx2Ops>(base, values, start_from_zero)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn npv_simd_neon(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
+    npv_simd_generic::<NeonOps>(base, values, start_from_zero)
+}
+
+fn npv_autovec(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
+    unsafe { npv_simd_generic::<AutoVecOps>(base, values, start_from_zero) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn npv_with_deriv_avx(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
+    npv_with_deriv_generic::<AvxOps>(rate, values, start_index)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn npv_with_deriv_avx2(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
+    npv_with_deriv_generic::<Avx2Ops>(rate, values, start_index)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn npv_with_deriv_neon(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
+    npv_with_deriv_generic::<NeonOps>(rate, values, start_index)
+}
+
+fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
+    unsafe { npv_with_deriv_generic::<AutoVecOps>(rate, values, start_index) }
+}
+
+/// SIMD-accelerated NPV calculation
+#[inline]
+pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
+    if rate == 0.0 {
+        return values.iter().sum();
+    }
+
+    let start_from_zero = start_from_zero.unwrap_or(true);
+    let base = 1.0 + rate;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::env::var("ENABLE_AVX2").map(|x| x == "1").unwrap_or(true)
+            && Avx2Ops::is_supported()
+            && values.len() > 8
+        {
+            return unsafe { npv_simd_avx2(base, values, start_from_zero) };
+        } else if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
+            && AvxOps::is_supported()
+            && values.len() > 8
+        {
+            return unsafe { npv_simd_avx(base, values, start_from_zero) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
+            return unsafe { npv_simd_neon(base, values, start_from_zero) };
+        }
+    }
+
+    // Fallback optimized for auto-vectorization
+    npv_autovec(base, values, start_from_zero)
+}
+
+/// SIMD-accelerated NPV with derivative calculation
+#[inline]
+pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
+    if rate <= -1.0 {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    // Process first value separately
+    let sum = values[0];
+    let deriv = 0.0;
+
+    if values.len() <= 1 {
+        return (sum, deriv);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::env::var("ENABLE_AVX2").map(|x| x == "1").unwrap_or(true)
+            && Avx2Ops::is_supported()
+            && values.len() > 8
+        {
+            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_avx2(rate, &values[1..], 1) };
+            return (sum + simd_sum, deriv + simd_deriv);
+        } else if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
+            && AvxOps::is_supported()
+            && values.len() > 8
+        {
+            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_avx(rate, &values[1..], 1) };
+            return (sum + simd_sum, deriv + simd_deriv);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
+            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_neon(rate, &values[1..], 1) };
+            return (sum + simd_sum, deriv + simd_deriv);
+        }
+    }
+
+    // Fall back to auto-vectorized version
+    let (auto_sum, auto_deriv) = npv_with_deriv_autovec(rate, &values[1..], 1);
+    (sum + auto_sum, deriv + auto_deriv)
+}

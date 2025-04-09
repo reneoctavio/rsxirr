@@ -1,4 +1,5 @@
-use std::cmp::Ordering;
+mod irr;
+mod npv;
 
 use super::{
     models::{validate, InvalidPaymentsError},
@@ -7,7 +8,7 @@ use super::{
 };
 
 /// Powers iterator - generates powers efficiently with vectorization hints
-pub struct PowersIterator {
+struct PowersIterator {
     base: f64,
     current_idx: usize,
     total_count: usize,
@@ -67,7 +68,7 @@ impl Iterator for PowersIterator {
 
 /// SIMD-accelerated powers function
 #[inline]
-pub fn powers_simd(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
+fn powers_simd(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
     let start_power = if start_from_zero {
         0
     } else {
@@ -82,476 +83,36 @@ pub fn powers_simd(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<
     PowersIterator::new(base, start_power, total_count)
 }
 
-/// SIMD-accelerated NPV calculation
-#[inline]
-pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
-    if rate == 0.0 {
-        return values.iter().sum();
-    }
-
-    let start_from_zero = start_from_zero.unwrap_or(true);
-    let base = 1.0 + rate;
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Skip AVX if environment variable is set
-        if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
-            && is_x86_feature_detected!("avx")
-            && values.len() > 8
-        {
-            return unsafe { npv_simd_avx(base, values, start_from_zero) };
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
-            return unsafe { npv_simd_neon(base, values, start_from_zero) };
-        }
-    }
-
-    // Fallback optimized for auto-vectorization
-    npv_autovec(base, values, start_from_zero)
-}
-
-/// Auto-vectorizable NPV implementation
-#[inline]
-fn npv_autovec(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    // Use multiple accumulators to help compiler auto-vectorize
-    const UNROLL: usize = 4;
-    let mut power = if start_from_zero {
-        1.0
-    } else {
-        base
-    };
-
-    // Create multiple accumulators
-    let mut sums = [0.0; UNROLL];
-    let n = values.len();
-    let main_part = n - (n % UNROLL);
-
-    // Main loop with multiple accumulators
-    for chunk in 0..(main_part / UNROLL) {
-        let mut local_powers = [power; UNROLL];
-
-        // Calculate powers for this chunk
-        for i in 1..UNROLL {
-            local_powers[i] = local_powers[i - 1] * base;
-        }
-
-        // Update accumulators
-        for i in 0..UNROLL {
-            let idx = chunk * UNROLL + i;
-            sums[i] += values[idx] / local_powers[i];
-        }
-
-        // Update power for next chunk
-        power = local_powers[UNROLL - 1] * base;
-    }
-
-    // Combine accumulators into a sum
-    let mut sum = sums.iter().sum();
-
-    // Process remaining elements
-    for &value in &values[main_part..n] {
-        sum += value / power;
-        power *= base;
-    }
-
-    sum
-}
-
-/// AVX implementation for NPV
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn npv_simd_avx(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    use std::arch::x86_64::*;
-
-    let mut sum = 0.0;
-    let mut power = if start_from_zero {
-        1.0
-    } else {
-        base
-    };
-
-    let vec_base = _mm256_set1_pd(base);
-    let chunk_size = 4;
-
-    // Process 4 elements at a time
-    let simd_limit = (values.len() / chunk_size) * chunk_size;
-
-    for i in (0..simd_limit).step_by(chunk_size) {
-        // Create initial vector with same power
-        let vec_power_base = _mm256_set1_pd(power);
-
-        // Create multipliers [1, base, base^2, base^3]
-        let vec_mult = _mm256_set_pd(base * base * base, base * base, base, 1.0);
-
-        // Multiply to get [power, power*base, power*base^2, power*base^3]
-        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = _mm256_loadu_pd(&values[i]);
-
-        // Divide values by powers
-        let vec_result = _mm256_div_pd(vec_values, vec_power);
-
-        // Sum the results
-        let mut result_array = [0.0; 4];
-        _mm256_storeu_pd(result_array.as_mut_ptr(), vec_result);
-        sum += result_array.iter().sum::<f64>();
-
-        // Update power for next chunk - power *= base^4
-        // Use SIMD to compute base^4
-        let base4 =
-            _mm256_mul_pd(_mm256_mul_pd(vec_base, vec_base), _mm256_mul_pd(vec_base, vec_base));
-        // Extract the scalar value
-        power *= _mm256_cvtsd_f64(base4);
-    }
-
-    // Process remaining elements
-    for &value in &values[simd_limit..] {
-        sum += value / power;
-        power *= base;
-    }
-
-    sum
-}
-
-/// NEON implementation for NPV (Apple Silicon, AWS Graviton)
-#[cfg(target_arch = "aarch64")]
-unsafe fn npv_simd_neon(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    use std::arch::aarch64::*;
-
-    let mut sum = 0.0;
-    let mut power = if start_from_zero {
-        1.0
-    } else {
-        base
-    };
-
-    let vec_base = vdupq_n_f64(base);
-    let chunk_size = 2; // NEON processes 2 doubles at a time
-
-    // Process 2 elements at a time
-    let simd_limit = (values.len() / chunk_size) * chunk_size;
-
-    for i in (0..simd_limit).step_by(chunk_size) {
-        // Create initial vector with same power
-        let vec_power_base = vdupq_n_f64(power);
-
-        // Create multipliers [1, base]
-        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
-
-        // Multiply to get [power, power*base]
-        let vec_power = vmulq_f64(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = vld1q_f64(&values[i]);
-
-        // Divide values by powers
-        let vec_result = vdivq_f64(vec_values, vec_power);
-
-        // Sum the results
-        let mut result_array = [0.0; 2];
-        vst1q_f64(result_array.as_mut_ptr(), vec_result);
-        sum += result_array.iter().sum::<f64>();
-
-        // Update power for next chunk - power *= base²
-        let base2 = vmulq_f64(vec_base, vec_base);
-        power *= vgetq_lane_f64(base2, 0);
-    }
-
-    // Process remaining elements
-    for i in simd_limit..values.len() {
-        sum += values[i] / power;
-        power *= base;
-    }
-
-    sum
-}
-
-/// SIMD-accelerated NPV with derivative calculation
-#[inline]
-pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
-    if rate <= -1.0 {
-        return (f64::INFINITY, f64::INFINITY);
-    }
-
-    if values.is_empty() {
-        return (0.0, 0.0);
-    }
-
-    // Process first value separately
-    let sum = values[0];
-    let deriv = 0.0;
-
-    if values.len() <= 1 {
-        return (sum, deriv);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
-            && is_x86_feature_detected!("avx")
-            && values.len() > 8
-        {
-            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_avx(rate, &values[1..], 1) };
-            return (sum + simd_sum, deriv + simd_deriv);
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
-            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_neon(rate, &values[1..], 1) };
-            return (sum + simd_sum, deriv + simd_deriv);
-        }
-    }
-
-    // Fall back to auto-vectorized version
-    let (auto_sum, auto_deriv) = npv_with_deriv_autovec(rate, &values[1..], 1);
-    (sum + auto_sum, deriv + auto_deriv)
-}
-
-/// Auto-vectorizable implementation of NPV with derivative
-#[inline]
-fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    let base = 1.0 + rate;
-    let inv_base = 1.0 / base;
-
-    // Use multiple accumulators to help compiler auto-vectorize
-    const UNROLL: usize = 4;
-    let mut sums = [0.0; UNROLL];
-    let mut derivs = [0.0; UNROLL];
-
-    let mut power = base;
-    let n = values.len();
-    let main_part = n - (n % UNROLL);
-
-    // Process main part with multiple accumulators
-    for chunk in 0..(main_part / UNROLL) {
-        let mut powers = [power; UNROLL];
-
-        // Calculate powers for this chunk
-        for i in 1..UNROLL {
-            powers[i] = powers[i - 1] * base;
-        }
-
-        // Update accumulators
-        for i in 0..UNROLL {
-            let idx = chunk * UNROLL + i;
-            let term = values[idx] / powers[i];
-            sums[i] += term;
-
-            let index = start_index + idx;
-            derivs[i] -= (index as f64) * term * inv_base;
-        }
-
-        // Update power for next chunk
-        power = powers[UNROLL - 1] * base;
-    }
-
-    // Combine accumulators
-    let mut sum = sums.iter().sum();
-    let mut deriv = derivs.iter().sum();
-
-    // Process remaining elements
-    for (i, &value) in values[main_part..n].iter().enumerate() {
-        let term = value / power;
-        sum += term;
-
-        let index = start_index + main_part + i;
-        deriv -= (index as f64) * term * inv_base;
-
-        power *= base;
-    }
-
-    (sum, deriv)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn npv_with_deriv_avx(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    use std::arch::x86_64::*;
-
-    let base = 1.0 + rate;
-    let inv_base = 1.0 / base;
-
-    let mut sum = 0.0;
-    let mut deriv = 0.0;
-    let mut power = base;
-
-    let vec_base = _mm256_set1_pd(base);
-    let vec_inv_base = _mm256_set1_pd(inv_base);
-    let vec_neg_one = _mm256_set1_pd(-1.0);
-    let chunk_size = 4;
-
-    // Process chunks of 4 elements
-    let simd_limit = (values.len() / chunk_size) * chunk_size;
-
-    // Pre-compute base^2 and base^3 using SIMD operations
-    let vec_base_squared = _mm256_mul_pd(vec_base, vec_base);
-    let vec_base_cubed = _mm256_mul_pd(vec_base_squared, vec_base);
-    // Pre-compute base^4 for power updates
-    let vec_base4 = _mm256_mul_pd(vec_base_squared, vec_base_squared);
-    let base4 = _mm256_cvtsd_f64(vec_base4);
-
-    for chunk_idx in 0..(simd_limit / chunk_size) {
-        let idx = chunk_idx * chunk_size;
-
-        // Create initial vector with same power
-        let vec_power_base = _mm256_set1_pd(power);
-
-        // Create multipliers vector using pre-computed SIMD values
-        // [1.0, base, base^2, base^3]
-        let vec_mult = _mm256_set_pd(
-            _mm256_cvtsd_f64(vec_base_cubed),   // base^3
-            _mm256_cvtsd_f64(vec_base_squared), // base^2
-            base,                               // base
-            1.0,                                // 1.0
-        );
-
-        // Multiply to get [power, power*base, power*base^2, power*base^3]
-        let vec_power = _mm256_mul_pd(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = _mm256_loadu_pd(&values[idx]);
-
-        // Create index vector for derivative
-        let vec_indices = _mm256_set_pd(
-            (start_index + idx + 3) as f64,
-            (start_index + idx + 2) as f64,
-            (start_index + idx + 1) as f64,
-            (start_index + idx) as f64,
-        );
-
-        // Calculate terms
-        let vec_term = _mm256_div_pd(vec_values, vec_power);
-
-        // Calculate derivative terms
-        let vec_deriv = _mm256_mul_pd(vec_indices, vec_term);
-        let vec_deriv = _mm256_mul_pd(vec_deriv, vec_inv_base);
-        let vec_deriv = _mm256_mul_pd(vec_deriv, vec_neg_one);
-
-        // Store results
-        let mut term_array = [0.0; 4];
-        let mut deriv_array = [0.0; 4];
-        _mm256_storeu_pd(term_array.as_mut_ptr(), vec_term);
-        _mm256_storeu_pd(deriv_array.as_mut_ptr(), vec_deriv);
-
-        sum += term_array.iter().sum::<f64>();
-        deriv += deriv_array.iter().sum::<f64>();
-
-        // Update power for next chunk using pre-computed base^4
-        power *= base4;
-    }
-
-    // Process remaining elements
-    for (i, &value) in values[simd_limit..].iter().enumerate() {
-        let term = value / power;
-        sum += term;
-
-        // Adjust index since enumerate starts from 0 for the slice
-        let index = start_index + simd_limit + i;
-        deriv -= (index as f64) * term * inv_base;
-
-        power *= base;
-    }
-
-    (sum, deriv)
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn npv_with_deriv_neon(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    use std::arch::aarch64::*;
-
-    let base = 1.0 + rate;
-    let inv_base = 1.0 / base;
-
-    let mut sum = 0.0;
-    let mut deriv = 0.0;
-    let mut power = base;
-
-    let vec_base = vdupq_n_f64(base);
-    let vec_inv_base = vdupq_n_f64(inv_base);
-    let vec_neg_one = vdupq_n_f64(-1.0);
-    let chunk_size = 2;
-
-    // Process chunks of 2 elements
-    let simd_limit = (values.len() / chunk_size) * chunk_size;
-
-    // Pre-compute base^2 for power updates
-    let vec_base_squared = vmulq_f64(vec_base, vec_base);
-    let base2 = vgetq_lane_f64(vec_base_squared, 0);
-
-    for chunk_idx in 0..(simd_limit / chunk_size) {
-        let idx = chunk_idx * chunk_size;
-
-        // Create initial vector with same power
-        let vec_power_base = vdupq_n_f64(power);
-
-        // Create multipliers [1.0, base]
-        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
-
-        // Multiply to get [power, power*base]
-        let vec_power = vmulq_f64(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = vld1q_f64(&values[idx]);
-
-        // Create index vector for derivative
-        let vec_indices = vcombine_f64(
-            vdup_n_f64((start_index + idx) as f64),
-            vdup_n_f64((start_index + idx + 1) as f64),
-        );
-
-        // Calculate terms
-        let vec_term = vdivq_f64(vec_values, vec_power);
-
-        // Calculate derivative terms
-        let vec_deriv = vmulq_f64(vec_indices, vec_term);
-        let vec_deriv = vmulq_f64(vec_deriv, vec_inv_base);
-        let vec_deriv = vmulq_f64(vec_deriv, vec_neg_one);
-
-        // Store results
-        let mut term_array = [0.0; 2];
-        let mut deriv_array = [0.0; 2];
-        vst1q_f64(term_array.as_mut_ptr(), vec_term);
-        vst1q_f64(deriv_array.as_mut_ptr(), vec_deriv);
-
-        sum += term_array.iter().sum::<f64>();
-        deriv += deriv_array.iter().sum::<f64>();
-
-        // Update power for next chunk
-        power *= base2;
-    }
-
-    // Process remaining elements
-    for i in simd_limit..values.len() {
-        let term = values[i] / power;
-        sum += term;
-        deriv -= ((start_index + i) as f64) * term * inv_base;
-        power *= base;
-    }
-
-    (sum, deriv)
-}
-
 // Replacement functions that use the new SIMD implementations
 #[inline(always)]
-pub fn powers(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
+fn powers(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
     powers_simd(base, n, start_from_zero)
 }
 
+/// Calculates the net present value of a series of cash flows
+///
+/// # Arguments
+///
+/// * `rate` - Discount rate per period
+/// * `values` - Array of cash flows, starting from time 0
+/// * `start_from_zero` - If true, the first value is interpreted as occurring at time 0.
+///   If false, the first value is interpreted as occurring at time 1. Default is true.
+///
+/// # Returns
+///
+/// The net present value of the cash flows.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::npv;
+/// let values = vec![-40_000.0, 5_000.0, 8_000.0, 12_000.0, 30_000.0];
+/// let result = npv(0.08, &values, Some(true));
+/// assert_eq!(result, 3065.2226681790715);
+/// ```
 #[inline(always)]
 pub fn npv(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
-    npv_simd(rate, values, start_from_zero)
-}
-
-#[inline(always)]
-fn npv_with_deriv(rate: f64, values: &[f64]) -> (f64, f64) {
-    npv_with_deriv_simd(rate, values)
+    npv::npv_simd(rate, values, start_from_zero)
 }
 
 fn convert_pmt_at_beginning(pmt_at_beginning: bool) -> f64 {
@@ -562,6 +123,28 @@ fn convert_pmt_at_beginning(pmt_at_beginning: bool) -> f64 {
     }
 }
 
+/// Calculates the future value of an investment based on periodic payments and a constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The future value of the investment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::fv;
+/// let result = fv(0.05 / 12.0, 10.0 * 12.0, -100.0, -100.0, false);
+/// assert_eq!(result, 15692.92889433575);
+/// ```
 pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(pv + pmt * nper);
@@ -573,6 +156,28 @@ pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f6
     -pv * factor - pmt * (1.0 + rate * pmt_at_beginning) / rate * (factor - 1.0)
 }
 
+/// Calculates the present value of an investment based on future value, periodic payments, and constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The present value of the investment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::pv;
+/// let result = pv(0.05 / 12.0, 10.0 * 12.0, -100.0, 15692.93, false);
+/// assert_eq!(result, -100.0006713162);
+/// ```
 pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pmt * nper);
@@ -584,6 +189,28 @@ pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f6
     -(fv + pmt * factor) / exp
 }
 
+/// Calculates the periodic payment for a loan or investment with constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the loan or investment
+/// * `fv` - Future value of the loan or investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The payment amount per period.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::pmt;
+/// let result = pmt(0.05, 10.0, 100_000.0, 0.0, false);
+/// assert_eq!(result, -12950.45749654561);
+/// ```
 pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pv) / nper;
@@ -597,6 +224,29 @@ pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
     -(fv + pv * exp) / factor
 }
 
+/// Calculates the interest payment for a specific period of an investment based on constant payments and interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `per` - Period for which to calculate the interest, must be between 1 and nper
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The interest payment for the specified period, or NaN if per is out of bounds.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::ipmt;
+/// let result = ipmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
+/// assert_eq!(result, 2301.2385625860004);
+/// ```
 pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // let total_pmt = self::pmt(rate, nper, pv, fv, pmt_at_beginning);
     // let result = rate * self::fv(rate, per - 1.0, total_pmt, pv, pmt_at_beginning);
@@ -633,6 +283,29 @@ pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
     }
 }
 
+/// Calculates the principal payment for a specific period of an investment based on constant payments and interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `per` - Period for which to calculate the principal payment, must be between 1 and nper
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The principal payment for the specified period, or NaN if per is out of bounds.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::ppmt;
+/// let result = ppmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
+/// assert_eq!(result, 4173.9901856864);
+/// ```
 pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // assuming type = 1 if pmt_at_beginning else 0
     // assuming P=pv;F=fv;r=rate;n=nper;p=per;t=type, type in {1;0}
@@ -661,6 +334,28 @@ pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
         / ((rate + 1.).powf(nper + when) - rate * when - 1.)
 }
 
+/// Calculates the number of periods required for an investment to reach a specified future value
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The number of periods needed.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::nper;
+/// let result = nper(0.075, -2000.0, 0.0, 100_000.0, false);
+/// assert_eq!(result, 21.544944197323336);
+/// ```
 pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pv) / pmt;
@@ -672,6 +367,29 @@ pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
     f64::log10((-fv + z) / (pv + z)) / f64::log10(1. + rate)
 }
 
+/// Calculates the interest rate per period of an investment
+///
+/// # Arguments
+///
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+/// * `guess` - Initial guess for the rate (default is 0.1)
+///
+/// # Returns
+///
+/// The interest rate per period.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::rate;
+/// let result = rate(10.0, -12950.46, 100_000.0, 0.0, false, None);
+/// assert_eq!(result, 0.05);
+/// ```
 pub fn rate(
     nper: f64,
     pmt: f64,
@@ -685,230 +403,64 @@ pub fn rate(
     })
 }
 
-// http://westclintech.com/SQL-Server-Financial-Functions/SQL-Server-NFV-function
+/// Calculates the net future value of a series of cash flows
+///
+/// http://westclintech.com/SQL-Server-Financial-Functions/SQL-Server-NFV-function
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Number of periods to project the NFV
+/// * `amounts` - Array of cash flows
+///
+/// # Returns
+///
+/// The net future value of the cash flows.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::nfv;
+/// let amounts = vec![1050.0, 1350.0, 1350.0, 1450.0];
+/// let result = nfv(0.03, 6.0, &amounts);
+/// assert!((result - 5750.16).abs() < 0.01);
+/// ```
 pub fn nfv(rate: f64, nper: f64, amounts: &[f64]) -> f64 {
     let pv = npv(rate, amounts, Some(false));
     fv(rate, nper, 0.0, -pv, false)
 }
 
-// #[inline(always)]
-// pub fn npv(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
-//     if rate == 0.0 {
-//         return values.iter().sum();
-//     }
-//
-//     let start_from_zero = start_from_zero.unwrap_or(true);
-//     let base = 1.0 + rate;
-//
-//     // Manual loop unrolling and avoiding Vec allocation for powers
-//     let mut sum = 0.0;
-//     let mut power = if start_from_zero {
-//         1.0
-//     } else {
-//         base
-//     };
-//
-//     for &v in values {
-//         sum += v / power;
-//         power *= base;
-//     }
-//
-//     sum
-// }
-//
-// #[cfg(target_arch = "x86_64")]
-// #[inline(always)]
-// fn npv_with_deriv(rate: f64, values: &[f64]) -> (f64, f64) {
-//     use std::arch::x86_64::*;
-//
-//     if rate <= -1.0 {
-//         return (f64::INFINITY, f64::INFINITY);
-//     }
-//
-//     // Process first value separately (not discounted)
-//     let mut sum = values[0];
-//     let mut deriv = 0.0;
-//
-//     if values.len() <= 1 {
-//         return (sum, deriv);
-//     }
-//
-//     let base = 1.0 + rate;
-//     let inv_base = 1.0 / base;
-//
-//     // Decide whether to use SIMD or scalar version
-//     if is_x86_feature_detected!("avx2") && values.len() > 8 {
-//         unsafe {
-//             // Set up SIMD registers
-//             let vec_base = _mm256_set1_pd(base);
-//             let vec_inv_base = _mm256_set1_pd(inv_base);
-//
-//             // Start with the second value
-//             let mut power = base;
-//
-//             // Process 4 elements at a time
-//             let chunk_size = 4;
-//             let chunks = (values.len() - 1) / chunk_size;
-//
-//             for chunk_idx in 0..chunks {
-//                 let idx = 1 + chunk_idx * chunk_size;
-//
-//                 // Compute power vector more efficiently using vec_base
-//                 let vec_p0 = _mm256_set1_pd(power);
-//                 let vec_p1 = _mm256_mul_pd(vec_p0, vec_base);
-//                 let vec_p2 = _mm256_mul_pd(vec_p1, vec_base);
-//                 let vec_p3 = _mm256_mul_pd(vec_p2, vec_base);
-//                 let vec_power = _mm256_set_pd(
-//                     _mm256_cvtsd_f64(vec_p3), // power * base^3
-//                     _mm256_cvtsd_f64(vec_p2), // power * base^2
-//                     _mm256_cvtsd_f64(vec_p1), // power * base^1
-//                     _mm256_cvtsd_f64(vec_p0), // power
-//                 );
-//
-//                 // Load 4 values
-//                 let vec_values = _mm256_loadu_pd(&values[idx]);
-//
-//                 // Calculate indices for derivative
-//                 let vec_indices = _mm256_set_pd(
-//                     (idx + 3) as f64,
-//                     (idx + 2) as f64,
-//                     (idx + 1) as f64,
-//                     (idx) as f64,
-//                 );
-//
-//                 // Calculate v / power
-//                 let vec_term = _mm256_div_pd(vec_values, vec_power);
-//
-//                 // Calculate horizontal sum of terms
-//                 let mut term_array = [0.0; 4];
-//                 _mm256_storeu_pd(term_array.as_mut_ptr(), vec_term);
-//                 sum += term_array.iter().sum::<f64>();
-//
-//                 // Calculate derivative: -i * term / base
-//                 let vec_deriv = _mm256_mul_pd(vec_indices, vec_term);
-//                 let vec_deriv = _mm256_mul_pd(vec_deriv, vec_inv_base);
-//
-//                 // Calculate horizontal sum of derivative terms
-//                 let mut deriv_array = [0.0; 4];
-//                 _mm256_storeu_pd(deriv_array.as_mut_ptr(), vec_deriv);
-//                 deriv -= deriv_array.iter().sum::<f64>();
-//
-//                 // Update power for next chunk - use vec_base for multiplies
-//                 power *= _mm256_cvtsd_f64(_mm256_mul_pd(
-//                     _mm256_mul_pd(_mm256_mul_pd(vec_base, vec_base), vec_base),
-//                     vec_base,
-//                 ));
-//             }
-//
-//             // Process remaining elements
-//             let start = 1 + chunks * chunk_size;
-//             for i in start..values.len() {
-//                 let term = values[i] / power;
-//                 sum += term;
-//                 deriv -= (i as f64) * term * inv_base;
-//                 power *= base;
-//             }
-//         }
-//     } else {
-//         // Scalar fallback version
-//         let mut power = base;
-//         for i in 1..values.len() {
-//             let term = values[i] / power;
-//             sum += term;
-//             deriv -= (i as f64) * term * inv_base;
-//             power *= base;
-//         }
-//     }
-//
-//     (sum, deriv)
-// }
-
-// #[inline(always)]
-// fn npv_with_deriv(rate: f64, values: &[f64]) -> (f64, f64) {
-//     if rate <= -1.0 {
-//         return (f64::INFINITY, f64::INFINITY);
-//     }
-
-//     let base = 1.0 + rate;
-//     let inv_base = 1.0 / base;
-
-//     // Process first value separately
-//     let mut sum = values[0];
-//     let mut deriv = 0.0;
-
-//     if values.len() <= 1 {
-//         return (sum, deriv);
-//     }
-
-//     // Use multiple accumulators to enable compiler auto-vectorization
-//     let mut power = base;
-
-//     // Process 4 elements at a time using independent accumulators
-//     let chunks = (values.len() - 1) / 4;
-//     let mut sum1 = 0.0;
-//     let mut sum2 = 0.0;
-//     let mut sum3 = 0.0;
-//     let mut sum4 = 0.0;
-//     let mut deriv1 = 0.0;
-//     let mut deriv2 = 0.0;
-//     let mut deriv3 = 0.0;
-//     let mut deriv4 = 0.0;
-
-//     for chunk in 0..chunks {
-//         let i1 = 1 + chunk * 4;
-//         let i2 = i1 + 1;
-//         let i3 = i1 + 2;
-//         let i4 = i1 + 3;
-
-//         let p1 = power;
-//         let p2 = p1 * base;
-//         let p3 = p2 * base;
-//         let p4 = p3 * base;
-
-//         let term1 = values[i1] / p1;
-//         let term2 = values[i2] / p2;
-//         let term3 = values[i3] / p3;
-//         let term4 = values[i4] / p4;
-
-//         sum1 += term1;
-//         sum2 += term2;
-//         sum3 += term3;
-//         sum4 += term4;
-
-//         deriv1 -= (i1 as f64) * term1 * inv_base;
-//         deriv2 -= (i2 as f64) * term2 * inv_base;
-//         deriv3 -= (i3 as f64) * term3 * inv_base;
-//         deriv4 -= (i4 as f64) * term4 * inv_base;
-
-//         power = p4 * base;
-//     }
-
-//     // Combine accumulators
-//     sum += sum1 + sum2 + sum3 + sum4;
-//     deriv += deriv1 + deriv2 + deriv3 + deriv4;
-
-//     // Process remaining elements
-//     for i in (1 + chunks * 4)..values.len() {
-//         let term = values[i] / power;
-//         sum += term;
-//         deriv -= (i as f64) * term * inv_base;
-//         power *= base;
-//     }
-
-//     (sum, deriv)
-// }
-
+/// Calculates the Internal Rate of Return (IRR) for a series of cash flows
+///
+/// # Arguments
+///
+/// * `values` - Array of cash flows where the first value is the initial investment (negative value)
+///   and subsequent values are returns (positive values)
+/// * `guess` - Initial guess for the rate (default is 0.1)
+///
+/// # Returns
+///
+/// A Result containing either the IRR as a decimal value, or an error if the calculation fails.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::irr;
+/// let values = vec![-100.0, 39.0, 59.0, 55.0, 20.0];
+/// let result = irr(&values, None).unwrap();
+/// assert!((result - 0.28094842116).abs() < 1e-7);
+/// ```
 pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsError> {
     let values = utils::trim_zeros(values);
     validate(values, None)?;
 
     // Fast path for small datasets
     if values.len() == 2 {
-        return Ok(irr_analytical_2(values));
+        return Ok(irr::irr_analytical_2(values));
     }
 
     if values.len() == 3 {
-        return Ok(irr_analytical_3(values));
+        return Ok(irr::irr_analytical_3(values));
     }
 
     let initial_guess = guess.unwrap_or(0.1);
@@ -920,7 +472,7 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
     }
 
     // Fallback to Newton-Raphson
-    let rate = newton_raphson_2(initial_guess, &|r| npv_with_deriv(r, values));
+    let rate = newton_raphson_2(initial_guess, &|r| npv::npv_with_deriv_simd(r, values));
 
     if utils::is_a_good_rate(rate, |r| npv(r, values, Some(true))) {
         return Ok(rate);
@@ -940,73 +492,27 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
     Ok(rate.unwrap_or(f64::NAN))
 }
 
-fn irr_analytical_2(values: &[f64]) -> f64 {
-    // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 = 0  => multiply by (1 + r)
-    // cf[0]*(1+r) + cf[1] = 0  => divide by cf[0] and move tho the right
-    // lets x = 1+r, a = cf[0], b = cf[1]
-    // solve a*x + b = 0
-    // x = -b/a, r = x - 1
-    -values[1] / values[0] - 1.0
-}
-
-fn irr_analytical_3(values: &[f64]) -> f64 {
-    // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 + cf[2]/(1+r)^2 = 0  => multiply by (1+r)^2
-    // cf[0]*(1+r)^2 + cf[1]*(1+r) + cf[2] = 0  => quadratic equation
-    // lets x = 1+r, a = cf[0], b = cf[1], c = cf[2]
-    // solve a*x^2 + b*x + c = 0
-    // x = 1 + r => r = x - 1
-    let (a, b, c) = (values[0], values[1], values[2]);
-
-    if a == 0.0 {
-        // 0*x^2 + bx + c = 0 =>
-        // x = -c/b
-        let x = -c / b;
-        return x - 1.0;
-    };
-
-    // x = (-b ± sqrt(b^2-4ac))/2a, a != 0
-    let d = b.powf(2.) - 4. * a * c; // discriminant
-
-    match d.total_cmp(&0.0) {
-        Ordering::Less => {
-            // no solutions
-            f64::NAN
-        }
-        Ordering::Equal => {
-            // exactly one solution
-            let x = -b / (2. * a);
-            x - 1.0
-        }
-        Ordering::Greater => {
-            // two solutions
-            let x1 = (-b + d.sqrt()) / (2. * a);
-            let x2 = (-b - d.sqrt()) / (2. * a);
-            // x = 1 + r => r = x - 1
-            let (r1, r2) = (x1 - 1.0, x2 - 1.0);
-
-            // rate < -1 doesn't make sense
-            match (r1.total_cmp(&-1.), r2.total_cmp(&-1.)) {
-                (Ordering::Less, Ordering::Less) => f64::NAN,
-                (Ordering::Equal | Ordering::Less, Ordering::Equal | Ordering::Less) => -1.0,
-                (Ordering::Greater, Ordering::Less | Ordering::Equal) => r1,
-                (Ordering::Less | Ordering::Equal, Ordering::Greater) => r2,
-                (Ordering::Greater, Ordering::Greater) => {
-                    // if both roots are non-negative,
-                    // choose the one that best approximates npv to zero
-                    let p1 = npv(r1, values, Some(true));
-                    let p2 = npv(r2, values, Some(true));
-
-                    if p1.abs() < p2.abs() {
-                        r1
-                    } else {
-                        r2
-                    }
-                }
-            }
-        }
-    }
-}
-
+/// Calculates the Modified Internal Rate of Return (MIRR) for a series of cash flows
+///
+/// # Arguments
+///
+/// * `values` - Array of cash flows where the first value is the initial investment (negative value)
+///   and subsequent values are returns (positive values)
+/// * `finance_rate` - Interest rate paid on the funds invested
+/// * `reinvest_rate` - Interest rate received on reinvestment of cash flows
+///
+/// # Returns
+///
+/// A Result containing either the MIRR as a decimal value, or an error if the calculation fails.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::mirr;
+/// let values = vec![-1000.0, 100.0, 250.0, 500.0, 500.0];
+/// let result = mirr(&values, 0.1, 0.1).unwrap();
+/// assert!((result - 0.10401626745).abs() < 1e-7);
+/// ```
 pub fn mirr(
     values: &[f64],
     finance_rate: f64,
@@ -1032,18 +538,29 @@ pub fn mirr(
 
 /// Calculates the cumulative principal payment between start_period and end_period
 ///
+/// https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMPRINC
+///
 /// # Arguments
 ///
 /// * `rate` - Interest rate per period
 /// * `nper` - Total number of payment periods
-/// * `pv` - Present value
+/// * `pv` - Present value of the investment
 /// * `start_period` - First period in the calculation
 /// * `end_period` - Last period in the calculation
-/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
 ///
 /// # Returns
 ///
-/// * `Option<f64>` - The cumulative principal payment, or None if calculation fails
+/// The cumulative principal payment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::cumprinc;
+/// let result = cumprinc(0.09 / 12.0, 30.0 * 12.0, 125_000.0, 13.0, 24.0, false);
+/// assert!((result + 934.10712).abs() < 1e-5);
+/// ```
 pub fn cumprinc(
     rate: f64,
     nper: f64,
@@ -1052,7 +569,6 @@ pub fn cumprinc(
     end_period: f64,
     pmt_at_beginning: bool,
 ) -> f64 {
-    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMPRINC
     (start_period.trunc() as u64..=end_period.trunc() as u64)
         .map(|per| ppmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning))
         .sum()
@@ -1060,18 +576,29 @@ pub fn cumprinc(
 
 /// Calculates the cumulative interest payment between start_period and end_period
 ///
+/// https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMIPMT
+///
 /// # Arguments
 ///
 /// * `rate` - Interest rate per period
 /// * `nper` - Total number of payment periods
-/// * `pv` - Present value
+/// * `pv` - Present value of the investment
 /// * `start_period` - First period in the calculation
 /// * `end_period` - Last period in the calculation
-/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
 ///
 /// # Returns
 ///
-/// * `f64` - The cumulative interest payment
+/// The cumulative interest payment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::cumipmt;
+/// let result = cumipmt(0.09 / 12.0, 30.0 * 12.0, 125_000.0, 13.0, 24.0, false);
+/// assert!((result + 11135.23213).abs() < 1e-5);
+/// ```
 pub fn cumipmt(
     rate: f64,
     nper: f64,
@@ -1080,7 +607,6 @@ pub fn cumipmt(
     end_period: f64,
     pmt_at_beginning: bool,
 ) -> f64 {
-    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMIPMT
     (start_period.trunc() as u64..=end_period.trunc() as u64)
         .map(|per| ipmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning))
         .sum()
