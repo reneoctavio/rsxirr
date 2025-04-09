@@ -11,6 +11,7 @@ pub(crate) fn trim_zeros(p: &[f64]) -> &[f64] {
     &p[non_zero_range(p)]
 }
 
+#[inline(always)]
 pub(crate) fn fast_pow(a: f64, b: f64) -> f64 {
     // works only if a is positive
     (a.log2() * b).exp2()

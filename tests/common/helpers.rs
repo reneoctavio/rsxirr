@@ -4,6 +4,7 @@ use csv::ReaderBuilder;
 use time::{macros::format_description, Date};
 
 /// Loads payments from a CSV file
+#[allow(dead_code)]
 pub fn load_payments_from_csv<P: AsRef<Path>>(
     path: P,
 ) -> Result<Vec<(Date, f64)>, Box<dyn std::error::Error>> {
@@ -54,6 +55,7 @@ pub fn load_payments_from_csv<P: AsRef<Path>>(
 }
 
 /// Splits a payment sequence into dates and amounts
+#[allow(dead_code)]
 pub fn split_payments(payments: &[(Date, f64)]) -> (Vec<pyxirr::DateLike>, Vec<f64>) {
     let dates = payments.iter().map(|(date, _)| (*date).into()).collect();
     let amounts = payments.iter().map(|(_, amount)| *amount).collect();

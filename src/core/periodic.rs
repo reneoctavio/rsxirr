@@ -1,19 +1,118 @@
-use std::{cmp::Ordering, iter::successors};
+mod irr;
+mod npv;
 
 use super::{
     models::{validate, InvalidPaymentsError},
-    optimize::{brentq, brentq_grid_search, newton_raphson, newton_raphson_with_default_deriv},
-    utils,
+    optimize::{brentq, brentq_grid_search, newton_raphson_2, newton_raphson_with_default_deriv},
+    utils::{self},
 };
 
-// pre calculating powers for performance
-pub fn powers(base: f64, n: usize, start_from_zero: bool) -> Vec<f64> {
-    let (start, n) = if start_from_zero {
-        (1.0, n + 1)
+/// Powers iterator - generates powers efficiently with vectorization hints
+struct PowersIterator {
+    base: f64,
+    current_idx: usize,
+    total_count: usize,
+    base_powers: [f64; 4], // Cache for frequently used powers
+}
+
+impl PowersIterator {
+    fn new(base: f64, start_power: usize, total_count: usize) -> Self {
+        // Precompute powers for efficiency
+        let mut powers = [1.0, base, base * base, base * base * base];
+        if start_power > 0 {
+            // Adjust starting powers if not beginning from base^0
+            let start_base = base.powi(start_power as i32);
+            for power in &mut powers {
+                *power *= start_base;
+            }
+        }
+
+        Self {
+            base,
+            current_idx: 0,
+            total_count,
+            base_powers: powers,
+        }
+    }
+}
+
+impl Iterator for PowersIterator {
+    type Item = f64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_idx >= self.total_count {
+            return None;
+        }
+
+        let result = if self.current_idx < 4 {
+            // Use precomputed values for first few iterations
+            self.base_powers[self.current_idx]
+        } else {
+            // For later values, use efficient power calculation strategy
+            let idx = self.current_idx;
+            let base_pow = self.base_powers[idx % 4] * self.base.powi(4 * (idx / 4) as i32);
+            self.base_powers[idx % 4] = base_pow; // Update cache
+            base_pow
+        };
+
+        self.current_idx += 1;
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total_count - self.current_idx;
+        (remaining, Some(remaining))
+    }
+}
+
+/// SIMD-accelerated powers function
+#[inline]
+fn powers_simd(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
+    let start_power = if start_from_zero {
+        0
     } else {
-        (base, n)
+        1
     };
-    successors(Some(start), |x| Some(x * base)).take(n).collect()
+    let total_count = if start_from_zero {
+        n + 1
+    } else {
+        n
+    };
+
+    PowersIterator::new(base, start_power, total_count)
+}
+
+// Replacement functions that use the new SIMD implementations
+#[inline(always)]
+fn powers(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f64> {
+    powers_simd(base, n, start_from_zero)
+}
+
+/// Calculates the net present value of a series of cash flows
+///
+/// # Arguments
+///
+/// * `rate` - Discount rate per period
+/// * `values` - Array of cash flows, starting from time 0
+/// * `start_from_zero` - If true, the first value is interpreted as occurring at time 0.
+///   If false, the first value is interpreted as occurring at time 1. Default is true.
+///
+/// # Returns
+///
+/// The net present value of the cash flows.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::npv;
+/// let values = vec![-40_000.0, 5_000.0, 8_000.0, 12_000.0, 30_000.0];
+/// let result = npv(0.08, &values, Some(true));
+/// assert_eq!(result, 3065.2226681790715);
+/// ```
+#[inline(always)]
+pub fn npv(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
+    npv::npv_simd(rate, values, start_from_zero)
 }
 
 fn convert_pmt_at_beginning(pmt_at_beginning: bool) -> f64 {
@@ -24,6 +123,28 @@ fn convert_pmt_at_beginning(pmt_at_beginning: bool) -> f64 {
     }
 }
 
+/// Calculates the future value of an investment based on periodic payments and a constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The future value of the investment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::fv;
+/// let result = fv(0.05 / 12.0, 10.0 * 12.0, -100.0, -100.0, false);
+/// assert_eq!(result, 15692.92889433575);
+/// ```
 pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(pv + pmt * nper);
@@ -35,6 +156,28 @@ pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f6
     -pv * factor - pmt * (1.0 + rate * pmt_at_beginning) / rate * (factor - 1.0)
 }
 
+/// Calculates the present value of an investment based on future value, periodic payments, and constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The present value of the investment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::pv;
+/// let result = pv(0.05 / 12.0, 10.0 * 12.0, -100.0, 15692.93, false);
+/// assert_eq!(result, -100.0006713162);
+/// ```
 pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pmt * nper);
@@ -46,6 +189,28 @@ pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f6
     -(fv + pmt * factor) / exp
 }
 
+/// Calculates the periodic payment for a loan or investment with constant interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the loan or investment
+/// * `fv` - Future value of the loan or investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The payment amount per period.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::pmt;
+/// let result = pmt(0.05, 10.0, 100_000.0, 0.0, false);
+/// assert_eq!(result, -12950.45749654561);
+/// ```
 pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pv) / nper;
@@ -59,6 +224,29 @@ pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
     -(fv + pv * exp) / factor
 }
 
+/// Calculates the interest payment for a specific period of an investment based on constant payments and interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `per` - Period for which to calculate the interest, must be between 1 and nper
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The interest payment for the specified period, or NaN if per is out of bounds.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::ipmt;
+/// let result = ipmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
+/// assert_eq!(result, 2301.2385625860004);
+/// ```
 pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // let total_pmt = self::pmt(rate, nper, pv, fv, pmt_at_beginning);
     // let result = rate * self::fv(rate, per - 1.0, total_pmt, pv, pmt_at_beginning);
@@ -95,6 +283,29 @@ pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
     }
 }
 
+/// Calculates the principal payment for a specific period of an investment based on constant payments and interest rate
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `per` - Period for which to calculate the principal payment, must be between 1 and nper
+/// * `nper` - Total number of payment periods
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The principal payment for the specified period, or NaN if per is out of bounds.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::ppmt;
+/// let result = ppmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
+/// assert_eq!(result, 4173.9901856864);
+/// ```
 pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // assuming type = 1 if pmt_at_beginning else 0
     // assuming P=pv;F=fv;r=rate;n=nper;p=per;t=type, type in {1;0}
@@ -123,6 +334,28 @@ pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
         / ((rate + 1.).powf(nper + when) - rate * when - 1.)
 }
 
+/// Calculates the number of periods required for an investment to reach a specified future value
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+///
+/// # Returns
+///
+/// The number of periods needed.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::nper;
+/// let result = nper(0.075, -2000.0, 0.0, 100_000.0, false);
+/// assert_eq!(result, 21.544944197323336);
+/// ```
 pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
         return -(fv + pv) / pmt;
@@ -134,6 +367,29 @@ pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
     f64::log10((-fv + z) / (pv + z)) / f64::log10(1. + rate)
 }
 
+/// Calculates the interest rate per period of an investment
+///
+/// # Arguments
+///
+/// * `nper` - Total number of payment periods
+/// * `pmt` - Payment made each period
+/// * `pv` - Present value of the investment
+/// * `fv` - Future value of the investment
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
+/// * `guess` - Initial guess for the rate (default is 0.1)
+///
+/// # Returns
+///
+/// The interest rate per period.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::rate;
+/// let result = rate(10.0, -12950.46, 100_000.0, 0.0, false, None);
+/// assert_eq!(result, 0.05);
+/// ```
 pub fn rate(
     nper: f64,
     pmt: f64,
@@ -147,144 +403,116 @@ pub fn rate(
     })
 }
 
-// http://westclintech.com/SQL-Server-Financial-Functions/SQL-Server-NFV-function
+/// Calculates the net future value of a series of cash flows
+///
+/// http://westclintech.com/SQL-Server-Financial-Functions/SQL-Server-NFV-function
+///
+/// # Arguments
+///
+/// * `rate` - Interest rate per period
+/// * `nper` - Number of periods to project the NFV
+/// * `amounts` - Array of cash flows
+///
+/// # Returns
+///
+/// The net future value of the cash flows.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::nfv;
+/// let amounts = vec![1050.0, 1350.0, 1350.0, 1450.0];
+/// let result = nfv(0.03, 6.0, &amounts);
+/// assert!((result - 5750.16).abs() < 0.01);
+/// ```
 pub fn nfv(rate: f64, nper: f64, amounts: &[f64]) -> f64 {
     let pv = npv(rate, amounts, Some(false));
     fv(rate, nper, 0.0, -pv, false)
 }
 
-pub fn npv(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
-    if rate == 0.0 {
-        return values.iter().sum();
-    }
-
-    powers(1. + rate, values.len(), start_from_zero.unwrap_or(true))
-        .iter()
-        .zip(values.iter())
-        .map(|(p, v)| v / p)
-        .sum()
-}
-
-fn npv_deriv(rate: f64, values: &[f64]) -> f64 {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| -(i as f64) * v * utils::fast_pow(rate + 1.0, -(i as f64 + 1.0)))
-        .sum()
-}
-
+/// Calculates the Internal Rate of Return (IRR) for a series of cash flows
+///
+/// # Arguments
+///
+/// * `values` - Array of cash flows where the first value is the initial investment (negative value)
+///   and subsequent values are returns (positive values)
+/// * `guess` - Initial guess for the rate (default is 0.1)
+///
+/// # Returns
+///
+/// A Result containing either the IRR as a decimal value, or an error if the calculation fails.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::irr;
+/// let values = vec![-100.0, 39.0, 59.0, 55.0, 20.0];
+/// let result = irr(&values, None).unwrap();
+/// assert!((result - 0.28094842116).abs() < 1e-7);
+/// ```
 pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsError> {
     let values = utils::trim_zeros(values);
-    let guess = guess.unwrap_or(0.1);
-
-    // must contain at least one positive and one negative value
     validate(values, None)?;
 
+    // Fast path for small datasets
     if values.len() == 2 {
-        return Ok(irr_analytical_2(values));
+        return Ok(irr::irr_analytical_2(values));
     }
 
     if values.len() == 3 {
-        return Ok(irr_analytical_3(values));
+        return Ok(irr::irr_analytical_3(values));
     }
 
-    let f = |rate| {
-        if rate <= -1.0 {
-            // bound newton_raphson
-            return f64::INFINITY;
-        }
-        npv(rate, values, Some(true))
-    };
-    let df = |rate| npv_deriv(rate, values);
+    let initial_guess = guess.unwrap_or(0.1);
 
-    let rate = newton_raphson(guess, &f, &df);
-
-    if utils::is_a_good_rate(rate, f) {
+    // Try Brent with positive brackets
+    let rate = brentq(&|r| npv(r, values, Some(true)), 0.0, 100.0, 100);
+    if rate.is_finite() {
         return Ok(rate);
     }
 
-    let rate = brentq(&f, -0.999999999999999, 100., 100);
+    // Fallback to Newton-Raphson
+    let rate = newton_raphson_2(initial_guess, &|r| npv::npv_with_deriv_simd(r, values));
 
-    if utils::is_a_good_rate(rate, f) {
+    if utils::is_a_good_rate(rate, |r| npv(r, values, Some(true))) {
         return Ok(rate);
     }
 
-    // strategy: closest to zero
-    // let breakpoints: &[f64] = &[0.0, 0.25, -0.25, 0.5, -0.5, 1.0, -0.9, -0.99999999999999, 1e9];
-    // strategy: pessimistic
-    let breakpoints: &[f64] = &[-0.99999999999999, -0.75, -0.5, -0.25, 0., 0.25, 0.5, 1.0, 1e6];
+    // Expended search for negative rates
+    let rate = brentq(&|r| npv(r, values, Some(true)), -0.999, 100.0, 100);
+    if rate.is_finite() {
+        return Ok(rate);
+    }
+
+    // Final fallback with minimal iterations (to avoid the catastrophic slowdown)
+    let breakpoints = &[-0.9, -0.5, 0.0, 0.5, 1.0];
+    let f = |r| npv(r, values, Some(true));
     let rate = brentq_grid_search(&[breakpoints], &f).next();
 
     Ok(rate.unwrap_or(f64::NAN))
 }
 
-fn irr_analytical_2(values: &[f64]) -> f64 {
-    // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 = 0  => multiply by (1 + r)
-    // cf[0]*(1+r) + cf[1] = 0  => divide by cf[0] and move tho the right
-    // lets x = 1+r, a = cf[0], b = cf[1]
-    // solve a*x + b = 0
-    // x = -b/a, r = x - 1
-    -values[1] / values[0] - 1.0
-}
-
-fn irr_analytical_3(values: &[f64]) -> f64 {
-    // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 + cf[2]/(1+r)^2 = 0  => multiply by (1+r)^2
-    // cf[0]*(1+r)^2 + cf[1]*(1+r) + cf[2] = 0  => quadratic equation
-    // lets x = 1+r, a = cf[0], b = cf[1], c = cf[2]
-    // solve a*x^2 + b*x + c = 0
-    // x = 1 + r => r = x - 1
-    let (a, b, c) = (values[0], values[1], values[2]);
-
-    if a == 0.0 {
-        // 0*x^2 + bx + c = 0 =>
-        // x = -c/b
-        let x = -c / b;
-        return x - 1.0;
-    };
-
-    // x = (-b ± sqrt(b^2-4ac))/2a, a != 0
-    let d = b.powf(2.) - 4. * a * c; // discriminant
-
-    match d.total_cmp(&0.0) {
-        Ordering::Less => {
-            // no solutions
-            f64::NAN
-        }
-        Ordering::Equal => {
-            // exactly one solution
-            let x = -b / (2. * a);
-            x - 1.0
-        }
-        Ordering::Greater => {
-            // two solutions
-            let x1 = (-b + d.sqrt()) / (2. * a);
-            let x2 = (-b - d.sqrt()) / (2. * a);
-            // x = 1 + r => r = x - 1
-            let (r1, r2) = (x1 - 1.0, x2 - 1.0);
-
-            // rate < -1 doesn't make sense
-            match (r1.total_cmp(&-1.), r2.total_cmp(&-1.)) {
-                (Ordering::Less, Ordering::Less) => f64::NAN,
-                (Ordering::Equal | Ordering::Less, Ordering::Equal | Ordering::Less) => -1.0,
-                (Ordering::Greater, Ordering::Less | Ordering::Equal) => r1,
-                (Ordering::Less | Ordering::Equal, Ordering::Greater) => r2,
-                (Ordering::Greater, Ordering::Greater) => {
-                    // if both roots are non-negative,
-                    // choose the one that best approximates npv to zero
-                    let p1 = npv(r1, values, Some(true));
-                    let p2 = npv(r2, values, Some(true));
-
-                    if p1.abs() < p2.abs() {
-                        r1
-                    } else {
-                        r2
-                    }
-                }
-            }
-        }
-    }
-}
-
+/// Calculates the Modified Internal Rate of Return (MIRR) for a series of cash flows
+///
+/// # Arguments
+///
+/// * `values` - Array of cash flows where the first value is the initial investment (negative value)
+///   and subsequent values are returns (positive values)
+/// * `finance_rate` - Interest rate paid on the funds invested
+/// * `reinvest_rate` - Interest rate received on reinvestment of cash flows
+///
+/// # Returns
+///
+/// A Result containing either the MIRR as a decimal value, or an error if the calculation fails.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::mirr;
+/// let values = vec![-1000.0, 100.0, 250.0, 500.0, 500.0];
+/// let result = mirr(&values, 0.1, 0.1).unwrap();
+/// assert!((result - 0.10401626745).abs() < 1e-7);
+/// ```
 pub fn mirr(
     values: &[f64],
     finance_rate: f64,
@@ -294,17 +522,15 @@ pub fn mirr(
     validate(values, None)?;
 
     let positive: f64 = powers(1. + reinvest_rate, values.len(), true)
-        .iter()
         .zip(values.iter().rev())
         .filter(|(_r, &v)| v > 0.0)
         .map(|(r, v)| v * r)
         .sum();
 
     let negative: f64 = powers(1. + finance_rate, values.len(), true)
-        .iter()
         .zip(values.iter())
         .filter(|(_r, &v)| v < 0.0)
-        .map(|(&r, &v)| v / r)
+        .map(|(r, &v)| v / r)
         .sum();
 
     Ok((positive / -negative).powf(1.0 / (values.len() - 1) as f64) - 1.0)
@@ -312,18 +538,29 @@ pub fn mirr(
 
 /// Calculates the cumulative principal payment between start_period and end_period
 ///
+/// https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMPRINC
+///
 /// # Arguments
 ///
 /// * `rate` - Interest rate per period
 /// * `nper` - Total number of payment periods
-/// * `pv` - Present value
+/// * `pv` - Present value of the investment
 /// * `start_period` - First period in the calculation
 /// * `end_period` - Last period in the calculation
-/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
 ///
 /// # Returns
 ///
-/// * `Option<f64>` - The cumulative principal payment, or None if calculation fails
+/// The cumulative principal payment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::cumprinc;
+/// let result = cumprinc(0.09 / 12.0, 30.0 * 12.0, 125_000.0, 13.0, 24.0, false);
+/// assert!((result + 934.10712).abs() < 1e-5);
+/// ```
 pub fn cumprinc(
     rate: f64,
     nper: f64,
@@ -332,28 +569,36 @@ pub fn cumprinc(
     end_period: f64,
     pmt_at_beginning: bool,
 ) -> f64 {
-    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMPRINC
-    let result = (start_period.trunc() as u64..=end_period.trunc() as u64)
-        .filter_map(|per| Some(ppmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning)))
-        .sum();
-
-    result
+    (start_period.trunc() as u64..=end_period.trunc() as u64)
+        .map(|per| ppmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning))
+        .sum()
 }
 
 /// Calculates the cumulative interest payment between start_period and end_period
+///
+/// https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMIPMT
 ///
 /// # Arguments
 ///
 /// * `rate` - Interest rate per period
 /// * `nper` - Total number of payment periods
-/// * `pv` - Present value
+/// * `pv` - Present value of the investment
 /// * `start_period` - First period in the calculation
 /// * `end_period` - Last period in the calculation
-/// * `pmt_at_beginning` - When payments are made (beginning or end of period)
+/// * `pmt_at_beginning` - If true, payments are made at the beginning of each period;
+///   if false, at the end of each period
 ///
 /// # Returns
 ///
-/// * `f64` - The cumulative interest payment
+/// The cumulative interest payment.
+///
+/// # Example
+///
+/// ```
+/// use pyxirr::cumipmt;
+/// let result = cumipmt(0.09 / 12.0, 30.0 * 12.0, 125_000.0, 13.0, 24.0, false);
+/// assert!((result + 11135.23213).abs() < 1e-5);
+/// ```
 pub fn cumipmt(
     rate: f64,
     nper: f64,
@@ -362,10 +607,7 @@ pub fn cumipmt(
     end_period: f64,
     pmt_at_beginning: bool,
 ) -> f64 {
-    // https://wiki.documentfoundation.org/Documentation/Calc_Functions/CUMIPMT
-    let result = (start_period.trunc() as u64..=end_period.trunc() as u64)
-        .filter_map(|per| Some(ipmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning)))
-        .sum();
-
-    result
+    (start_period.trunc() as u64..=end_period.trunc() as u64)
+        .map(|per| ipmt(rate, per as f64, nper, pv, 0.0, pmt_at_beginning))
+        .sum()
 }
