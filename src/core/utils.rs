@@ -4,7 +4,13 @@ pub(crate) fn non_zero_range(p: &[f64]) -> Range<usize> {
     let n = p.len();
     let first_non_zero_index = p.iter().position(|&x| x != 0.0).unwrap_or(n);
     let last_non_zero_index = n - p.iter().rev().position(|&x| x != 0.0).unwrap_or(n);
-    first_non_zero_index..last_non_zero_index
+
+    // Handle the case where all elements are zero
+    if first_non_zero_index >= last_non_zero_index {
+        0..0 // Return empty range
+    } else {
+        first_non_zero_index..last_non_zero_index
+    }
 }
 
 pub(crate) fn trim_zeros(p: &[f64]) -> &[f64] {
@@ -38,4 +44,16 @@ where
     F: Fn(f64) -> f64,
 {
     rate.is_finite() && f(rate).abs() < 1e-3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trim_zeros_all_zeros() {
+        let values = vec![0.0, 0.0, 0.0];
+        let result = trim_zeros(&values);
+        assert!(result.is_empty(), "Expected empty slice for all zeros");
+    }
 }
