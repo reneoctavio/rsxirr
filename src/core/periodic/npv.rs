@@ -695,3 +695,366 @@ pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
     let (auto_sum, auto_deriv) = npv_with_deriv_autovec(rate, &values[1..], 1);
     (sum + auto_sum, deriv + auto_deriv)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_npv_implementation<S: SimdOps>(values: &[f64], rate: f64) -> f64 {
+        unsafe {
+            let base = 1.0 + rate;
+            npv_simd_generic::<S>(base, values, true)
+        }
+    }
+
+    fn test_npv_deriv_implementation<S: SimdOps>(values: &[f64], rate: f64) -> (f64, f64) {
+        unsafe { npv_with_deriv_generic::<S>(rate, values, 0) }
+    }
+
+    fn get_reference_npv(values: &[f64], rate: f64) -> f64 {
+        let base = 1.0 + rate;
+        let mut sum = 0.0;
+        let mut power = 1.0;
+        for &val in values {
+            sum += val / power;
+            power *= base;
+        }
+        sum
+    }
+
+    fn get_reference_npv_deriv(values: &[f64], rate: f64, start_index: usize) -> (f64, f64) {
+        let base = 1.0 + rate;
+        let inv_base = 1.0 / base;
+        let mut sum = 0.0;
+        let mut deriv = 0.0;
+        let mut power = base;
+
+        for (i, &val) in values.iter().enumerate() {
+            let term = val / power;
+            sum += term;
+            // Use the provided start_index
+            deriv -= ((i + start_index) as f64) * term * inv_base;
+            power *= base;
+        }
+
+        (sum, deriv)
+    }
+
+    #[test]
+    fn test_simd_implementations_boundary_cases() {
+        let test_cases = vec![
+            vec![],                                                      // empty
+            vec![100.0],                                                 // single value
+            vec![100.0, -30.0],                                          // less than chunk size
+            vec![100.0, -30.0, 20.0],                                    // less than chunk size
+            vec![100.0, -30.0, 20.0, 15.0],                              // exact chunk size (4)
+            vec![100.0, -30.0, 20.0, 15.0, 5.0],                         // chunk size + 1
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0],       // exactly 8
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0, 12.0], // > 8 (SIMD threshold)
+        ];
+
+        let rate = 0.05;
+
+        for values in &test_cases {
+            let ref_npv = get_reference_npv(values, rate);
+            let (ref_sum, ref_deriv) = get_reference_npv_deriv(values, rate, 0);
+
+            // Test AutoVecOps (always available)
+            {
+                let auto_npv = test_npv_implementation::<AutoVecOps>(values, rate);
+                assert!(
+                    (auto_npv - ref_npv).abs() < 1e-6,
+                    "AutoVecOps NPV failed for len {}: got {}, expected {}",
+                    values.len(),
+                    auto_npv,
+                    ref_npv
+                );
+
+                let (auto_sum, auto_deriv) =
+                    test_npv_deriv_implementation::<AutoVecOps>(values, rate);
+                assert!(
+                    (auto_sum - ref_sum).abs() < 1e-6 && (auto_deriv - ref_deriv).abs() < 1e-6,
+                    "AutoVecOps NPV+deriv failed for len {}",
+                    values.len()
+                );
+            }
+
+            // Test AVX implementation if supported
+            #[cfg(target_arch = "x86_64")]
+            if AvxOps::is_supported() {
+                let avx_npv = test_npv_implementation::<AvxOps>(values, rate);
+                assert!(
+                    (avx_npv - ref_npv).abs() < 1e-6,
+                    "AVX NPV failed for len {}: got {}, expected {}",
+                    values.len(),
+                    avx_npv,
+                    ref_npv
+                );
+
+                let (avx_sum, avx_deriv) = test_npv_deriv_implementation::<AvxOps>(values, rate);
+                assert!(
+                    (avx_sum - ref_sum).abs() < 1e-6 && (avx_deriv - ref_deriv).abs() < 1e-6,
+                    "AVX NPV+deriv failed for len {}",
+                    values.len()
+                );
+            }
+
+            // Test AVX2+FMA implementation if supported
+            #[cfg(target_arch = "x86_64")]
+            if Avx2Ops::is_supported() {
+                let avx2_npv = test_npv_implementation::<Avx2Ops>(values, rate);
+                assert!(
+                    (avx2_npv - ref_npv).abs() < 1e-6,
+                    "AVX2 NPV failed for len {}: got {}, expected {}",
+                    values.len(),
+                    avx2_npv,
+                    ref_npv
+                );
+
+                let (avx2_sum, avx2_deriv) = test_npv_deriv_implementation::<Avx2Ops>(values, rate);
+                assert!(
+                    (avx2_sum - ref_sum).abs() < 1e-6 && (avx2_deriv - ref_deriv).abs() < 1e-6,
+                    "AVX2 NPV+deriv failed for len {}",
+                    values.len()
+                );
+            }
+
+            // Test NEON implementation on ARM
+            #[cfg(target_arch = "aarch64")]
+            {
+                let neon_npv = test_npv_implementation::<NeonOps>(values, rate);
+                assert!(
+                    (neon_npv - ref_npv).abs() < 1e-6,
+                    "NEON NPV failed for len {}: got {}, expected {}",
+                    values.len(),
+                    neon_npv,
+                    ref_npv
+                );
+
+                let (neon_sum, neon_deriv) = test_npv_deriv_implementation::<NeonOps>(values, rate);
+                assert!(
+                    (neon_sum - ref_sum).abs() < 1e-6 && (neon_deriv - ref_deriv).abs() < 1e-6,
+                    "NEON NPV+deriv failed for len {}",
+                    values.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_implementations_non_zero_start() {
+        let test_cases = vec![
+            vec![],                                                      // empty
+            vec![100.0],                                                 // single value
+            vec![100.0, -30.0],                                          // less than chunk size
+            vec![100.0, -30.0, 20.0],                                    // less than chunk size
+            vec![100.0, -30.0, 20.0, 15.0],                              // exact chunk size (4)
+            vec![100.0, -30.0, 20.0, 15.0, 5.0],                         // chunk size + 1
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0],       // exactly 8
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0, 12.0], // > 8 (SIMD threshold)
+        ];
+
+        let rate = 0.05;
+
+        for values in &test_cases {
+            // Test with start_from_zero = false for each implementation
+            let base = 1.0 + rate;
+            let mut sum = 0.0;
+            let mut power = base; // Start from base instead of 1.0
+            for &val in values {
+                sum += val / power;
+                power *= base;
+            }
+            let ref_npv = sum;
+
+            // Test AutoVecOps
+            let auto_npv = unsafe { npv_simd_generic::<AutoVecOps>(base, values, false) };
+            assert!(
+                (auto_npv - ref_npv).abs() < 1e-6,
+                "AutoVecOps NPV(non-zero start) failed for len {}: got {}, expected {}",
+                values.len(),
+                auto_npv,
+                ref_npv
+            );
+
+            // Test other implementations...
+            #[cfg(target_arch = "x86_64")]
+            if AvxOps::is_supported() {
+                let avx_npv = unsafe { npv_simd_generic::<AvxOps>(base, values, false) };
+                assert!(
+                    (avx_npv - ref_npv).abs() < 1e-6,
+                    "AVX NPV(non-zero start) failed for len {}: got {}, expected {}",
+                    values.len(),
+                    avx_npv,
+                    ref_npv
+                );
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            if Avx2Ops::is_supported() {
+                let avx2_npv = unsafe { npv_simd_generic::<Avx2Ops>(base, values, false) };
+                assert!(
+                    (avx2_npv - ref_npv).abs() < 1e-6,
+                    "AVX2 NPV(non-zero start) failed for len {}: got {}, expected {}",
+                    values.len(),
+                    avx2_npv,
+                    ref_npv
+                );
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let neon_npv = unsafe { npv_simd_generic::<NeonOps>(base, values, false) };
+                assert!(
+                    (neon_npv - ref_npv).abs() < 1e-6,
+                    "NEON NPV(non-zero start) failed for len {}: got {}, expected {}",
+                    values.len(),
+                    neon_npv,
+                    ref_npv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_implementations_with_start_index() {
+        let test_cases = vec![
+            vec![],                                                      // empty
+            vec![100.0],                                                 // single value
+            vec![100.0, -30.0],                                          // less than chunk size
+            vec![100.0, -30.0, 20.0],                                    // less than chunk size
+            vec![100.0, -30.0, 20.0, 15.0],                              // exact chunk size (4)
+            vec![100.0, -30.0, 20.0, 15.0, 5.0],                         // chunk size + 1
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0],       // exactly 8
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0, 12.0], // > 8 (SIMD threshold)
+        ];
+
+        let rate = 0.05;
+        let start_index = 1;
+
+        for values in &test_cases {
+            let (ref_sum, ref_deriv) = get_reference_npv_deriv(values, rate, start_index);
+
+            // Test all implementations with start_index = 1
+            let (auto_sum, auto_deriv) =
+                unsafe { npv_with_deriv_generic::<AutoVecOps>(rate, values, start_index) };
+            assert!(
+                (auto_sum - ref_sum).abs() < 1e-6 && (auto_deriv - ref_deriv).abs() < 1e-6,
+                "AutoVecOps NPV+deriv with start_index failed for len {}",
+                values.len()
+            );
+
+            // Test other implementations...
+            #[cfg(target_arch = "x86_64")]
+            if AvxOps::is_supported() {
+                let (avx_sum, avx_deriv) =
+                    unsafe { npv_with_deriv_generic::<AvxOps>(rate, values, start_index) };
+                assert!(
+                    (avx_sum - ref_sum).abs() < 1e-6 && (avx_deriv - ref_deriv).abs() < 1e-6,
+                    "AVX NPV+deriv with start_index failed for len {}",
+                    values.len()
+                );
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            if Avx2Ops::is_supported() {
+                let (avx2_sum, avx2_deriv) =
+                    unsafe { npv_with_deriv_generic::<Avx2Ops>(rate, values, start_index) };
+                assert!(
+                    (avx2_sum - ref_sum).abs() < 1e-6 && (avx2_deriv - ref_deriv).abs() < 1e-6,
+                    "AVX2 NPV+deriv with start_index failed for len {}",
+                    values.len(),
+                );
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (neon_sum, neon_deriv) =
+                    unsafe { npv_with_deriv_generic::<NeonOps>(rate, values, start_index) };
+                assert!(
+                    (neon_sum - ref_sum).abs() < 1e-6 && (neon_deriv - ref_deriv).abs() < 1e-6,
+                    "NEON NPV+deriv with start_index failed for len {}",
+                    values.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_public_npv_functions() {
+        let test_cases = vec![
+            vec![],                                                      // empty
+            vec![100.0],                                                 // single value
+            vec![100.0, -30.0],                                          // less than chunk size
+            vec![100.0, -30.0, 20.0],                                    // less than chunk size
+            vec![100.0, -30.0, 20.0, 15.0],                              // exact chunk size (4)
+            vec![100.0, -30.0, 20.0, 15.0, 5.0],                         // chunk size + 1
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0],       // exactly 8
+            vec![100.0, -30.0, 20.0, 15.0, 5.0, -10.0, 25.0, 8.0, 12.0], // > 8 (SIMD threshold)
+        ];
+
+        let rate = 0.05;
+
+        for values in &test_cases {
+            // Test public NPV function
+            let ref_npv = get_reference_npv(values, rate);
+            let npv = npv_simd(rate, values, Some(true));
+            assert!(
+                (npv - ref_npv).abs() < 1e-6,
+                "npv_simd failed for len {}: got {}, expected {}",
+                values.len(),
+                npv,
+                ref_npv
+            );
+
+            // Test public NPV with derivative function
+            if !values.is_empty() {
+                let (sum, deriv) = npv_with_deriv_simd(rate, values);
+                let first = values[0];
+                let (ref_sum, ref_deriv) = if values.len() > 1 {
+                    let (s, d) = get_reference_npv_deriv(&values[1..], rate, 1);
+                    (first + s, d)
+                } else {
+                    (first, 0.0)
+                };
+
+                assert!(
+                    (sum - ref_sum).abs() < 1e-6 && (deriv - ref_deriv).abs() < 1e-6,
+                    "npv_with_deriv_simd failed for len {}: got ({}, {}), expected ({}, {})",
+                    values.len(),
+                    sum,
+                    deriv,
+                    ref_sum,
+                    ref_deriv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_npv_with_deriv_simd_empty_array() {
+        let empty: Vec<f64> = vec![];
+        let rate = 0.05;
+
+        // Test with empty array
+        let (sum, deriv) = npv_with_deriv_simd(rate, &empty);
+        assert_eq!(sum, 0.0, "NPV of empty array should be 0.0");
+        assert_eq!(deriv, 0.0, "Derivative of empty array should be 0.0");
+
+        // Test with rate <= -1.0 and empty array
+        let (sum, deriv) = npv_with_deriv_simd(-1.0, &empty);
+        assert!(
+            sum.is_infinite() && sum.is_sign_positive(),
+            "NPV should be positive infinity for rate <= -1.0"
+        );
+        assert!(
+            deriv.is_infinite() && deriv.is_sign_positive(),
+            "Derivative should be positive infinity for rate <= -1.0"
+        );
+
+        // Test with rate = 0.0 and empty array
+        let (sum, deriv) = npv_with_deriv_simd(0.0, &empty);
+        assert_eq!(sum, 0.0, "NPV of empty array should be 0.0 when rate = 0.0");
+        assert_eq!(deriv, 0.0, "Derivative of empty array should be 0.0 when rate = 0.0");
+    }
+}
