@@ -575,10 +575,87 @@ unsafe fn npv_simd_avx(base: f64, values: &[f64], start_from_zero: bool) -> f64 
     npv_simd_generic::<AvxOps>(base, values, start_from_zero)
 }
 
+/// Lanes consumed per iteration of the AVX2 kernels: two 4-wide vectors, so the discount
+/// factor and accumulator chains are independent and the loop is not latency-bound.
+#[cfg(target_arch = "x86_64")]
+const AVX2_BLOCK: usize = 8;
+
+/// Shortest slice worth entering the AVX2 kernel for, rather than the auto-vectorized
+/// fallback. Measured, not assumed — see `benches/npv_kernel.rs`.
+#[cfg(target_arch = "x86_64")]
+const AVX2_MIN_LEN: usize = 6;
+
+/// Horizontal sum of a 4-wide vector. Done once at the end of a kernel, never per chunk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn hsum_pd(v: std::arch::x86_64::__m256d) -> f64 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castpd256_pd128(v);
+    let hi = _mm256_extractf128_pd(v, 1);
+    let s = _mm_add_pd(lo, hi);
+    _mm_cvtsd_f64(_mm_add_sd(s, _mm_unpackhi_pd(s, s)))
+}
+
+/// NPV over the whole slice in one pass.
+///
+/// Replaces the per-chunk `SimdOps` path, which recomputed `[1, b, b², b³]` and `b⁴` for
+/// every four elements, divided by the discount factor, and round-tripped the result
+/// through the stack to sum it. Here the powers of `1/base` are carried in registers, the
+/// division becomes a multiply, and there is exactly one horizontal reduction at the end.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn npv_simd_avx2(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    npv_simd_generic::<Avx2Ops>(base, values, start_from_zero)
+    use std::arch::x86_64::*;
+
+    let inv_base = 1.0 / base;
+    let ib2 = inv_base * inv_base;
+    let ib3 = ib2 * inv_base;
+    let ib4 = ib2 * ib2;
+
+    // discount factor of the first element: base^0 or base^-1
+    let p0 = if start_from_zero {
+        1.0
+    } else {
+        inv_base
+    };
+
+    let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
+    let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+    let step = _mm256_set1_pd(ib4 * ib4);
+
+    let mut acc_lo = _mm256_setzero_pd();
+    let mut acc_hi = _mm256_setzero_pd();
+
+    let ptr = values.as_ptr();
+    let blocks = values.len() / AVX2_BLOCK;
+
+    for k in 0..blocks {
+        let i = k * AVX2_BLOCK;
+        acc_lo = _mm256_fmadd_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
+        acc_hi = _mm256_fmadd_pd(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi, acc_hi);
+        pow_lo = _mm256_mul_pd(pow_lo, step);
+        pow_hi = _mm256_mul_pd(pow_hi, step);
+    }
+
+    // A remainder of 4 or more is still worth a vector step; only the last 0-3 go scalar.
+    let mut i = blocks * AVX2_BLOCK;
+    if values.len() - i >= 4 {
+        acc_lo = _mm256_fmadd_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
+        pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+        i += 4;
+    }
+
+    let mut sum = hsum_pd(_mm256_add_pd(acc_lo, acc_hi));
+
+    // lane 0 of pow_lo is the discount factor of the next unprocessed element
+    let mut power = _mm256_cvtsd_f64(pow_lo);
+    while i < values.len() {
+        sum += *ptr.add(i) * power;
+        power *= inv_base;
+        i += 1;
+    }
+
+    sum
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -596,10 +673,86 @@ unsafe fn npv_with_deriv_avx(rate: f64, values: &[f64], start_index: usize) -> (
     npv_with_deriv_generic::<AvxOps>(rate, values, start_index)
 }
 
+/// NPV and its derivative over the whole slice in one pass.
+///
+/// Same treatment as [`npv_simd_avx2`], plus: the index vector is carried and incremented
+/// rather than rebuilt from four `usize -> f64` conversions per chunk, and the `-1/base`
+/// factor common to every derivative term is applied once at the end instead of per element.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn npv_with_deriv_avx2(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    npv_with_deriv_generic::<Avx2Ops>(rate, values, start_index)
+    use std::arch::x86_64::*;
+
+    let base = 1.0 + rate;
+    let inv_base = 1.0 / base;
+    let ib2 = inv_base * inv_base;
+    let ib3 = ib2 * inv_base;
+    let ib4 = ib2 * ib2;
+
+    // Matches `npv_with_deriv_generic`: the discount exponent starts at 1 whatever
+    // `start_index` is — the caller has already handled element 0 — while `start_index`
+    // only feeds the derivative's index weights. The two coincide for the production
+    // call, which passes `&values[1..]` with `start_index == 1`.
+    let p0 = inv_base;
+
+    let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
+    let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+    let step = _mm256_set1_pd(ib4 * ib4);
+
+    let si = start_index as f64;
+    let mut idx_lo = _mm256_set_pd(si + 3.0, si + 2.0, si + 1.0, si);
+    let mut idx_hi = _mm256_add_pd(idx_lo, _mm256_set1_pd(4.0));
+    let idx_step = _mm256_set1_pd(AVX2_BLOCK as f64);
+
+    let mut sum_lo = _mm256_setzero_pd();
+    let mut sum_hi = _mm256_setzero_pd();
+    // accumulates sum(i * v_i / base^i); scaled by -1/base once the loop is done
+    let mut deriv_lo = _mm256_setzero_pd();
+    let mut deriv_hi = _mm256_setzero_pd();
+
+    let ptr = values.as_ptr();
+    let blocks = values.len() / AVX2_BLOCK;
+
+    for k in 0..blocks {
+        let i = k * AVX2_BLOCK;
+
+        let term_lo = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
+        let term_hi = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi);
+
+        sum_lo = _mm256_add_pd(sum_lo, term_lo);
+        sum_hi = _mm256_add_pd(sum_hi, term_hi);
+
+        deriv_lo = _mm256_fmadd_pd(term_lo, idx_lo, deriv_lo);
+        deriv_hi = _mm256_fmadd_pd(term_hi, idx_hi, deriv_hi);
+
+        pow_lo = _mm256_mul_pd(pow_lo, step);
+        pow_hi = _mm256_mul_pd(pow_hi, step);
+        idx_lo = _mm256_add_pd(idx_lo, idx_step);
+        idx_hi = _mm256_add_pd(idx_hi, idx_step);
+    }
+
+    let mut i = blocks * AVX2_BLOCK;
+    if values.len() - i >= 4 {
+        let term = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
+        sum_lo = _mm256_add_pd(sum_lo, term);
+        deriv_lo = _mm256_fmadd_pd(term, idx_lo, deriv_lo);
+        pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+        i += 4;
+    }
+
+    let mut sum = hsum_pd(_mm256_add_pd(sum_lo, sum_hi));
+    let mut weighted = hsum_pd(_mm256_add_pd(deriv_lo, deriv_hi));
+
+    let mut power = _mm256_cvtsd_f64(pow_lo);
+    while i < values.len() {
+        let term = *ptr.add(i) * power;
+        sum += term;
+        weighted += (start_index + i) as f64 * term;
+        power *= inv_base;
+        i += 1;
+    }
+
+    (sum, -weighted * inv_base)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -663,7 +816,7 @@ pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64
 
     #[cfg(target_arch = "x86_64")]
     {
-        if values.len() > 8 {
+        if values.len() >= AVX2_MIN_LEN {
             match simd_tier() {
                 SimdTier::Avx2 => return unsafe { npv_simd_avx2(base, values, start_from_zero) },
                 SimdTier::Avx => return unsafe { npv_simd_avx(base, values, start_from_zero) },
@@ -704,7 +857,7 @@ pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if values.len() > 8 {
+        if values.len() >= AVX2_MIN_LEN {
             match simd_tier() {
                 SimdTier::Avx2 => {
                     let (simd_sum, simd_deriv) =
@@ -1094,5 +1247,106 @@ mod tests {
         let (sum, deriv) = npv_with_deriv_simd(0.0, &empty);
         assert_eq!(sum, 0.0, "NPV of empty array should be 0.0 when rate = 0.0");
         assert_eq!(deriv, 0.0, "Derivative of empty array should be 0.0 when rate = 0.0");
+    }
+
+    /// The rewritten AVX2 kernels must agree with the scalar reference at every length:
+    /// below the block size, exactly on a block boundary, and at each of the seven
+    /// possible remainders past one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_kernels_match_reference() {
+        if !Avx2Ops::is_supported() {
+            eprintln!("AVX2 not supported on this CPU, skipping");
+            return;
+        }
+
+        for &rate in &[0.05, 0.12, -0.35, 0.9, 2.5, 1e-6, -0.999] {
+            let base = 1.0 + rate;
+
+            for len in 0..40usize {
+                // varied signs and magnitudes, deterministic
+                let values: Vec<f64> = (0..len)
+                    .map(|i| {
+                        let x = (i as f64 + 1.0) * 137.0357;
+                        if i % 3 == 0 {
+                            -x * 1000.0
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+
+                for &start_from_zero in &[true, false] {
+                    let got = unsafe { npv_simd_avx2(base, &values, start_from_zero) };
+                    let want =
+                        unsafe { npv_simd_generic::<AutoVecOps>(base, &values, start_from_zero) };
+                    let tol = 1e-9 * want.abs().max(1.0);
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "npv mismatch: rate {rate}, len {len}, start_from_zero {start_from_zero}: got {got}, want {want}"
+                    );
+                }
+
+                for &start_index in &[0usize, 1, 5] {
+                    let (got_sum, got_deriv) =
+                        unsafe { npv_with_deriv_avx2(rate, &values, start_index) };
+                    let (want_sum, want_deriv) =
+                        unsafe { npv_with_deriv_generic::<AutoVecOps>(rate, &values, start_index) };
+
+                    let sum_tol = 1e-9 * want_sum.abs().max(1.0);
+                    let deriv_tol = 1e-9 * want_deriv.abs().max(1.0);
+                    assert!(
+                        (got_sum - want_sum).abs() <= sum_tol,
+                        "deriv-sum mismatch: rate {rate}, len {len}, start_index {start_index}: got {got_sum}, want {want_sum}"
+                    );
+                    assert!(
+                        (got_deriv - want_deriv).abs() <= deriv_tol,
+                        "deriv mismatch: rate {rate}, len {len}, start_index {start_index}: got {got_deriv}, want {want_deriv}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Long series: the reciprocal-power chain accumulates error over the whole slice, so
+    /// check it stays negligible rather than assuming it does.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_kernels_long_series_accuracy() {
+        if !Avx2Ops::is_supported() {
+            return;
+        }
+
+        let values: Vec<f64> = (0..5000)
+            .map(|i| {
+                if i == 0 {
+                    -1.0e8
+                } else {
+                    25_000.0 + (i % 7) as f64 * 13.0
+                }
+            })
+            .collect();
+
+        for &rate in &[0.004, 0.05, 0.35] {
+            let base = 1.0 + rate;
+
+            let got = unsafe { npv_simd_avx2(base, &values, true) };
+            let want = get_reference_npv(&values, rate);
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "long npv drift: rate {rate}: got {got}, want {want}"
+            );
+
+            let (got_sum, got_deriv) = unsafe { npv_with_deriv_avx2(rate, &values[1..], 1) };
+            let (want_sum, want_deriv) = get_reference_npv_deriv(&values[1..], rate, 1);
+            assert!(
+                (got_sum - want_sum).abs() <= 1e-9 * want_sum.abs().max(1.0),
+                "long deriv-sum drift: rate {rate}: got {got_sum}, want {want_sum}"
+            );
+            assert!(
+                (got_deriv - want_deriv).abs() <= 1e-9 * want_deriv.abs().max(1.0),
+                "long deriv drift: rate {rate}: got {got_deriv}, want {want_deriv}"
+            );
+        }
     }
 }

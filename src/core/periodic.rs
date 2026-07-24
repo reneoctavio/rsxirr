@@ -3,7 +3,10 @@ mod npv;
 
 use super::{
     models::{validate, InvalidPaymentsError},
-    optimize::{brentq, brentq_grid_search, newton_raphson_2, newton_raphson_with_default_deriv},
+    optimize::{
+        brentq, brentq_grid_search, newton_raphson_2, newton_raphson_warm,
+        newton_raphson_with_default_deriv,
+    },
     utils::{self},
 };
 
@@ -463,7 +466,30 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
         return Ok(irr::irr_analytical_3(values));
     }
 
-    let initial_guess = guess.unwrap_or(0.1);
+    // A caller-supplied guess means "the root is near here". The dominant case is an IRR
+    // series, where each period's rate is close to the previous period's, so Newton from
+    // that start converges in a couple of iterations. The bracket search below ignores the
+    // guess entirely and always sweeps [0, 100], so without this the guess only ever took
+    // effect when brentq failed outright.
+    //
+    // Capped low: a guess that turns out to be bad costs a few NPV evaluations before
+    // falling through to the unchanged cascade.
+    // `npv_scale` and `initial_guess` are both O(n), so they stay off the path taken when
+    // the bracket search below succeeds on its own — which is the common case.
+    if let Some(guess) = guess {
+        const WARM_START_ITERATIONS: u32 = 6;
+
+        let rate = newton_raphson_warm(
+            guess,
+            &|r| npv::npv_with_deriv_simd(r, values),
+            WARM_START_ITERATIONS,
+        );
+
+        let tolerance = utils::converged_rate_tolerance(utils::npv_scale(values));
+        if utils::is_a_good_rate_within(rate, tolerance, |r| npv(r, values, Some(true))) {
+            return Ok(rate);
+        }
+    }
 
     // Try Brent with positive brackets
     let rate = brentq(&|r| npv(r, values, Some(true)), 0.0, 100.0, 100);
@@ -471,10 +497,27 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
         return Ok(rate);
     }
 
-    // Fallback to Newton-Raphson
+    // Fallback to Newton-Raphson. The seed is derived from the cash flow rather than a flat
+    // 0.1, which starts on the wrong side of zero for the loss-making prefixes of an IRR
+    // series. `xirr` already seeds this way.
+    let initial_guess = guess.unwrap_or_else(|| {
+        // npv(0) is just the sum of the cash flow, and npv decreases in the rate, so a
+        // negative sum puts the root below zero — where a flat 0.1 seed starts on the wrong
+        // side and Newton has to walk back across it. That is the loss-making prefix of an
+        // IRR series. Seeding from the data only in that case leaves the (much more common)
+        // positive-rate cash flows on their original, well-tuned 0.1 start.
+        if values.iter().sum::<f64>() < 0.0 {
+            utils::initial_guess(values)
+        } else {
+            0.1
+        }
+    });
     let rate = newton_raphson_2(initial_guess, &|r| npv::npv_with_deriv_simd(r, values));
 
-    if utils::is_a_good_rate(rate, |r| npv(r, values, Some(true))) {
+    // Scale-relative: with a flat 1e-3 this rejected perfectly good rates for large cash
+    // flows and fell through to the expensive [-0.999, 100] sweep below.
+    let tolerance = utils::approximate_rate_tolerance(utils::npv_scale(values));
+    if utils::is_a_good_rate_within(rate, tolerance, |r| npv(r, values, Some(true))) {
         return Ok(rate);
     }
 
@@ -485,7 +528,7 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
     }
 
     // Final fallback with minimal iterations (to avoid the catastrophic slowdown)
-    let breakpoints = &[-0.9, -0.5, 0.0, 0.5, 1.0];
+    let breakpoints = &[-0.99999999999999, -0.75, -0.5, -0.25, 0., 0.25, 0.5, 1.0, 1e6];
     let f = |r| npv(r, values, Some(true));
     let rate = brentq_grid_search(&[breakpoints], &f).next();
 
