@@ -61,7 +61,7 @@ fn test_fv_vectorized_multi() {
     let pv = [-100.0, -150.0, -200.0];
     let pmt_at_beginning = [false, false, true];
 
-    let mut result = vec![0.0; 3];
+    let mut result = [0.0; 3];
 
     for i in 0..3 {
         result[i] = fv(rates[i], nper[i], -100.0, pv[i], pmt_at_beginning[i]);
@@ -74,8 +74,8 @@ fn test_fv_vectorized_multi() {
 
 #[rstest]
 fn test_fv_vectorized_iterable() {
-    let pmt_values = vec![-100.0, -200.0, -300.0];
-    let mut actual = vec![0.0; 3];
+    let pmt_values = [-100.0, -200.0, -300.0];
+    let mut actual = [0.0; 3];
 
     for (i, &pmt) in pmt_values.iter().enumerate() {
         actual[i] = fv(0.05 / 12.0, 10.0 * 12.0, pmt, -100.0, false);
