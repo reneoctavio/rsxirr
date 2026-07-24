@@ -17,7 +17,7 @@ fn short_cash_flow() -> Vec<f64> {
 /// endpoint, so brentq's interpolation degenerates and it bisects the whole way down.
 fn long_cash_flow() -> Vec<f64> {
     let mut values = vec![-4002.0];
-    values.extend(std::iter::repeat(0.0).take(18));
+    values.extend(std::iter::repeat_n(0.0, 18));
     values.push(1e-60);
     values
 }
