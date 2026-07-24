@@ -611,6 +611,46 @@ fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64
     unsafe { npv_with_deriv_generic::<AutoVecOps>(rate, values, start_index) }
 }
 
+/// SIMD tier selected once per process from CPU support + the `ENABLE_*` overrides.
+///
+/// Neither the CPUID probe nor the environment changes during a run, so resolving this
+/// per call meant taking the process-wide environment `RwLock` inside the brentq inner
+/// loop. The override vars are read exactly once (at the first NPV call) and are frozen
+/// for the rest of the process.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimdTier {
+    Avx2,
+    Avx,
+    None,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn simd_tier() -> SimdTier {
+    static TIER: std::sync::LazyLock<SimdTier> = std::sync::LazyLock::new(|| {
+        if std::env::var("ENABLE_AVX2").map(|x| x == "1").unwrap_or(true) && Avx2Ops::is_supported()
+        {
+            SimdTier::Avx2
+        } else if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
+            && AvxOps::is_supported()
+        {
+            SimdTier::Avx
+        } else {
+            SimdTier::None
+        }
+    });
+    *TIER
+}
+
+/// NEON enablement, cached once. The original dispatch checked only the `ENABLE_NEON`
+/// env var (never `NeonOps::is_supported()`), so this preserves that exact behavior.
+#[cfg(target_arch = "aarch64")]
+fn neon_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true));
+    *ENABLED
+}
+
 /// SIMD-accelerated NPV calculation
 #[inline]
 pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
@@ -623,22 +663,18 @@ pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::env::var("ENABLE_AVX2").map(|x| x == "1").unwrap_or(true)
-            && Avx2Ops::is_supported()
-            && values.len() > 8
-        {
-            return unsafe { npv_simd_avx2(base, values, start_from_zero) };
-        } else if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
-            && AvxOps::is_supported()
-            && values.len() > 8
-        {
-            return unsafe { npv_simd_avx(base, values, start_from_zero) };
+        if values.len() > 8 {
+            match simd_tier() {
+                SimdTier::Avx2 => return unsafe { npv_simd_avx2(base, values, start_from_zero) },
+                SimdTier::Avx => return unsafe { npv_simd_avx(base, values, start_from_zero) },
+                SimdTier::None => {}
+            }
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
+        if neon_enabled() && values.len() > 8 {
             return unsafe { npv_simd_neon(base, values, start_from_zero) };
         }
     }
@@ -668,24 +704,26 @@ pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::env::var("ENABLE_AVX2").map(|x| x == "1").unwrap_or(true)
-            && Avx2Ops::is_supported()
-            && values.len() > 8
-        {
-            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_avx2(rate, &values[1..], 1) };
-            return (sum + simd_sum, deriv + simd_deriv);
-        } else if std::env::var("ENABLE_AVX").map(|x| x == "1").unwrap_or(true)
-            && AvxOps::is_supported()
-            && values.len() > 8
-        {
-            let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_avx(rate, &values[1..], 1) };
-            return (sum + simd_sum, deriv + simd_deriv);
+        if values.len() > 8 {
+            match simd_tier() {
+                SimdTier::Avx2 => {
+                    let (simd_sum, simd_deriv) =
+                        unsafe { npv_with_deriv_avx2(rate, &values[1..], 1) };
+                    return (sum + simd_sum, deriv + simd_deriv);
+                }
+                SimdTier::Avx => {
+                    let (simd_sum, simd_deriv) =
+                        unsafe { npv_with_deriv_avx(rate, &values[1..], 1) };
+                    return (sum + simd_sum, deriv + simd_deriv);
+                }
+                SimdTier::None => {}
+            }
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        if std::env::var("ENABLE_NEON").map(|x| x == "1").unwrap_or(true) && values.len() > 8 {
+        if neon_enabled() && values.len() > 8 {
             let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_neon(rate, &values[1..], 1) };
             return (sum + simd_sum, deriv + simd_deriv);
         }
