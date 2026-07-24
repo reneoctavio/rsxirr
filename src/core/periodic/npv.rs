@@ -322,110 +322,6 @@ impl SimdOps for Avx2Ops {
     }
 }
 
-/// NEON implementation for ARM
-#[cfg(target_arch = "aarch64")]
-struct NeonOps;
-
-#[cfg(target_arch = "aarch64")]
-impl SimdOps for NeonOps {
-    unsafe fn process_npv_chunk(
-        base: f64,
-        values: &[f64],
-        start_idx: usize,
-        power: f64,
-    ) -> (f64, f64) {
-        use std::arch::aarch64::*;
-
-        let vec_base = vdupq_n_f64(base);
-        let vec_power_base = vdupq_n_f64(power);
-
-        // Create multipliers [1, base]
-        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
-
-        // Multiply to get powers
-        let vec_power = vmulq_f64(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = vld1q_f64(&values[start_idx]);
-
-        // Divide values by powers
-        let vec_result = vdivq_f64(vec_values, vec_power);
-
-        // Sum the results
-        let mut result_array = [0.0; 2];
-        vst1q_f64(result_array.as_mut_ptr(), vec_result);
-        let sum = result_array.iter().sum::<f64>();
-
-        // Return sum and updated power
-        (sum, power * Self::precompute_power_factor(base))
-    }
-
-    unsafe fn process_npv_deriv_chunk(
-        base: f64,
-        inv_base: f64,
-        values: &[f64],
-        start_idx: usize,
-        power: f64,
-        start_index: usize,
-    ) -> (f64, f64, f64) {
-        use std::arch::aarch64::*;
-
-        let vec_base = vdupq_n_f64(base);
-        let vec_power_base = vdupq_n_f64(power);
-        let vec_inv_base = vdupq_n_f64(inv_base);
-        let vec_neg_one = vdupq_n_f64(-1.0);
-
-        // Create multipliers [1, base]
-        let vec_mult = vcombine_f64(vdup_n_f64(1.0), vdup_n_f64(base));
-
-        // Multiply to get powers
-        let vec_power = vmulq_f64(vec_power_base, vec_mult);
-
-        // Load values
-        let vec_values = vld1q_f64(&values[start_idx]);
-
-        // Create index vector for derivative
-        let vec_indices = vcombine_f64(
-            vdup_n_f64((start_index + start_idx) as f64),
-            vdup_n_f64((start_index + start_idx + 1) as f64),
-        );
-
-        // Calculate terms
-        let vec_term = vdivq_f64(vec_values, vec_power);
-
-        // Calculate derivative terms
-        let vec_deriv = vmulq_f64(vec_indices, vec_term);
-        let vec_deriv = vmulq_f64(vec_deriv, vec_inv_base);
-        let vec_deriv = vmulq_f64(vec_deriv, vec_neg_one);
-
-        // Store results
-        let mut term_array = [0.0; 2];
-        let mut deriv_array = [0.0; 2];
-        vst1q_f64(term_array.as_mut_ptr(), vec_term);
-        vst1q_f64(deriv_array.as_mut_ptr(), vec_deriv);
-
-        let sum = term_array.iter().sum::<f64>();
-        let deriv = deriv_array.iter().sum::<f64>();
-
-        (sum, deriv, power * Self::precompute_power_factor(base))
-    }
-
-    fn chunk_size() -> usize {
-        2
-    }
-
-    unsafe fn precompute_power_factor(base: f64) -> f64 {
-        use std::arch::aarch64::*;
-        let vec_base = vdupq_n_f64(base);
-        let vec_base_squared = vmulq_f64(vec_base, vec_base);
-        vgetq_lane_f64(vec_base_squared, 0)
-    }
-
-    fn is_supported() -> bool {
-        true
-    }
-}
-
 /// Auto-vectorized implementation
 struct AutoVecOps;
 
@@ -761,18 +657,228 @@ macro_rules! define_simd256_kernels {
 define_simd256_kernels!(npv_simd_avx2, npv_with_deriv_avx2, "avx2,fma", madd_fma);
 define_simd256_kernels!(npv_simd_avx, npv_with_deriv_avx, "avx", madd_mul_add);
 
+/// Lanes consumed per iteration of the NEON kernels. A NEON vector holds two doubles, so
+/// four of them are unrolled per iteration: that gives the same four independent
+/// accumulator chains as the 256-bit kernels, which is what keeps the loop throughput-bound
+/// rather than stalled on the ~4-cycle FMA latency.
 #[cfg(target_arch = "aarch64")]
+const NEON_BLOCK: usize = 8;
+
+/// Shortest slice worth entering [`npv_simd_neon`] for, rather than the auto-vectorized
+/// fallback. Measured on Apple M2, not assumed — see `benches/npv_kernel.rs`.
+#[cfg(target_arch = "aarch64")]
+const NEON_MIN_LEN: usize = 3;
+
+/// The same threshold for [`npv_with_deriv_neon`], which is higher: that kernel sets up
+/// eight vectors (four discount-factor chains, four index chains) before its first
+/// multiply, and only a whole 8-element block pays that back. Below this, `irr` measured
+/// slower with the kernel than without it. The kernel is handed `&values[1..]`, so a slice
+/// of this length gives it exactly one block.
+#[cfg(target_arch = "aarch64")]
+const NEON_DERIV_MIN_LEN: usize = NEON_BLOCK + 1;
+
+/// NPV over the whole slice in one pass.
+///
+/// Replaces the per-chunk `SimdOps` path, which rebuilt `[1, base]` and `base²` for every
+/// two elements, divided by the discount factor, and round-tripped the pair through the
+/// stack to sum it — two lanes of work per call, with a serial dependency between calls.
+/// Here the powers of `1/base` are carried in registers across four independent chains, the
+/// division becomes a multiply-accumulate, and there is exactly one horizontal reduction at
+/// the end.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn npv_simd_neon(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    npv_simd_generic::<NeonOps>(base, values, start_from_zero)
+    use std::arch::aarch64::*;
+
+    let inv_base = 1.0 / base;
+    let ib2 = inv_base * inv_base;
+    let ib4 = ib2 * ib2;
+    let ib8 = ib4 * ib4;
+
+    // discount factor of the first element: base^0 or base^-1
+    let p0 = if start_from_zero {
+        1.0
+    } else {
+        inv_base
+    };
+
+    // pow_j carries the factors of elements i + 2j and i + 2j + 1
+    let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
+    let mut pow1 = vmulq_n_f64(pow0, ib2);
+    let mut pow2 = vmulq_n_f64(pow0, ib4);
+    let mut pow3 = vmulq_n_f64(pow1, ib4);
+    let step = vdupq_n_f64(ib8);
+
+    let mut acc0 = vdupq_n_f64(0.0);
+    let mut acc1 = vdupq_n_f64(0.0);
+    let mut acc2 = vdupq_n_f64(0.0);
+    let mut acc3 = vdupq_n_f64(0.0);
+
+    let ptr = values.as_ptr();
+    let len = values.len();
+    let blocks = len / NEON_BLOCK;
+
+    for k in 0..blocks {
+        let i = k * NEON_BLOCK;
+        acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
+        acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i + 2)), pow1);
+        acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i + 4)), pow2);
+        acc3 = vfmaq_f64(acc3, vld1q_f64(ptr.add(i + 6)), pow3);
+        pow0 = vmulq_f64(pow0, step);
+        pow1 = vmulq_f64(pow1, step);
+        pow2 = vmulq_f64(pow2, step);
+        pow3 = vmulq_f64(pow3, step);
+    }
+
+    // Up to three whole pairs are left over; each already has its factors in pow_j, so the
+    // remainder costs no extra power arithmetic. `tail_pow` tracks the vector whose lane 0
+    // is the factor of the next unprocessed element.
+    let mut i = blocks * NEON_BLOCK;
+    let mut tail_pow = pow0;
+    if len - i >= 2 {
+        acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
+        i += 2;
+        tail_pow = pow1;
+    }
+    if len - i >= 2 {
+        acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i)), pow1);
+        i += 2;
+        tail_pow = pow2;
+    }
+    if len - i >= 2 {
+        acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i)), pow2);
+        i += 2;
+        tail_pow = pow3;
+    }
+
+    let acc = vaddq_f64(vaddq_f64(acc0, acc1), vaddq_f64(acc2, acc3));
+    let mut sum = vaddvq_f64(acc);
+
+    // at most one element left
+    if i < len {
+        sum += *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
+    }
+
+    sum
 }
 
 fn npv_autovec(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
     unsafe { npv_simd_generic::<AutoVecOps>(base, values, start_from_zero) }
 }
 
+/// NPV and its derivative over the whole slice in one pass.
+///
+/// Same treatment as [`npv_simd_neon`], plus: the index vector is carried and incremented
+/// rather than rebuilt from two `usize -> f64` conversions per chunk, and the `-1/base`
+/// factor common to every derivative term is applied once at the end instead of per element.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn npv_with_deriv_neon(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    npv_with_deriv_generic::<NeonOps>(rate, values, start_index)
+    use std::arch::aarch64::*;
+
+    let base = 1.0 + rate;
+    let inv_base = 1.0 / base;
+    let ib2 = inv_base * inv_base;
+    let ib4 = ib2 * ib2;
+    let ib8 = ib4 * ib4;
+
+    // Matches `npv_with_deriv_generic`: the discount exponent starts at 1 whatever
+    // `start_index` is — the caller has already handled element 0 — while `start_index`
+    // only feeds the derivative's index weights. The two coincide for the production
+    // call, which passes `&values[1..]` with `start_index == 1`.
+    let p0 = inv_base;
+
+    let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
+    let mut pow1 = vmulq_n_f64(pow0, ib2);
+    let mut pow2 = vmulq_n_f64(pow0, ib4);
+    let mut pow3 = vmulq_n_f64(pow1, ib4);
+    let step = vdupq_n_f64(ib8);
+
+    let si = start_index as f64;
+    let mut idx0 = vcombine_f64(vdup_n_f64(si), vdup_n_f64(si + 1.0));
+    let mut idx1 = vaddq_f64(idx0, vdupq_n_f64(2.0));
+    let mut idx2 = vaddq_f64(idx0, vdupq_n_f64(4.0));
+    let mut idx3 = vaddq_f64(idx0, vdupq_n_f64(6.0));
+    let idx_step = vdupq_n_f64(NEON_BLOCK as f64);
+
+    let mut sum0 = vdupq_n_f64(0.0);
+    let mut sum1 = vdupq_n_f64(0.0);
+    let mut sum2 = vdupq_n_f64(0.0);
+    let mut sum3 = vdupq_n_f64(0.0);
+    // accumulate sum(i * v_i / base^i); scaled by -1/base once the loop is done
+    let mut wgt0 = vdupq_n_f64(0.0);
+    let mut wgt1 = vdupq_n_f64(0.0);
+    let mut wgt2 = vdupq_n_f64(0.0);
+    let mut wgt3 = vdupq_n_f64(0.0);
+
+    let ptr = values.as_ptr();
+    let len = values.len();
+    let blocks = len / NEON_BLOCK;
+
+    for k in 0..blocks {
+        let i = k * NEON_BLOCK;
+
+        let term0 = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
+        let term1 = vmulq_f64(vld1q_f64(ptr.add(i + 2)), pow1);
+        let term2 = vmulq_f64(vld1q_f64(ptr.add(i + 4)), pow2);
+        let term3 = vmulq_f64(vld1q_f64(ptr.add(i + 6)), pow3);
+
+        sum0 = vaddq_f64(sum0, term0);
+        sum1 = vaddq_f64(sum1, term1);
+        sum2 = vaddq_f64(sum2, term2);
+        sum3 = vaddq_f64(sum3, term3);
+
+        wgt0 = vfmaq_f64(wgt0, term0, idx0);
+        wgt1 = vfmaq_f64(wgt1, term1, idx1);
+        wgt2 = vfmaq_f64(wgt2, term2, idx2);
+        wgt3 = vfmaq_f64(wgt3, term3, idx3);
+
+        pow0 = vmulq_f64(pow0, step);
+        pow1 = vmulq_f64(pow1, step);
+        pow2 = vmulq_f64(pow2, step);
+        pow3 = vmulq_f64(pow3, step);
+
+        idx0 = vaddq_f64(idx0, idx_step);
+        idx1 = vaddq_f64(idx1, idx_step);
+        idx2 = vaddq_f64(idx2, idx_step);
+        idx3 = vaddq_f64(idx3, idx_step);
+    }
+
+    let mut i = blocks * NEON_BLOCK;
+    let mut tail_pow = pow0;
+    if len - i >= 2 {
+        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
+        sum0 = vaddq_f64(sum0, term);
+        wgt0 = vfmaq_f64(wgt0, term, idx0);
+        i += 2;
+        tail_pow = pow1;
+    }
+    if len - i >= 2 {
+        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow1);
+        sum1 = vaddq_f64(sum1, term);
+        wgt1 = vfmaq_f64(wgt1, term, idx1);
+        i += 2;
+        tail_pow = pow2;
+    }
+    if len - i >= 2 {
+        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow2);
+        sum2 = vaddq_f64(sum2, term);
+        wgt2 = vfmaq_f64(wgt2, term, idx2);
+        i += 2;
+        tail_pow = pow3;
+    }
+
+    let mut sum = vaddvq_f64(vaddq_f64(vaddq_f64(sum0, sum1), vaddq_f64(sum2, sum3)));
+    let mut weighted = vaddvq_f64(vaddq_f64(vaddq_f64(wgt0, wgt1), vaddq_f64(wgt2, wgt3)));
+
+    // at most one element left
+    if i < len {
+        let term = *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
+        sum += term;
+        weighted += (start_index + i) as f64 * term;
+    }
+
+    (sum, -weighted * inv_base)
 }
 
 fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
@@ -810,8 +916,9 @@ fn simd_tier() -> SimdTier {
     *TIER
 }
 
-/// NEON enablement, cached once. The original dispatch checked only the `ENABLE_NEON`
-/// env var (never `NeonOps::is_supported()`), so this preserves that exact behavior.
+/// NEON enablement, cached once. There is no CPU probe to pair it with: NEON is mandatory
+/// on aarch64, so the env var is the only thing that can turn these kernels off — which is
+/// what `benches/npv_kernel.rs` uses to time the fallback.
 #[cfg(target_arch = "aarch64")]
 fn neon_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
@@ -842,10 +949,7 @@ pub fn npv_simd(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON still runs the original per-chunk kernel, so it keeps the original
-        // threshold. `SIMD256_MIN_LEN` was measured for the rewritten x86 kernels on
-        // x86 hardware and does not transfer; re-measure on ARM before reusing it.
-        if neon_enabled() && values.len() > 8 {
+        if neon_enabled() && values.len() >= NEON_MIN_LEN {
             return unsafe { npv_simd_neon(base, values, start_from_zero) };
         }
     }
@@ -894,10 +998,7 @@ pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON still runs the original per-chunk kernel, so it keeps the original
-        // threshold. `SIMD256_MIN_LEN` was measured for the rewritten x86 kernels on
-        // x86 hardware and does not transfer; re-measure on ARM before reusing it.
-        if neon_enabled() && values.len() > 8 {
+        if neon_enabled() && values.len() >= NEON_DERIV_MIN_LEN {
             let (simd_sum, simd_deriv) = unsafe { npv_with_deriv_neon(rate, &values[1..], 1) };
             return (sum + simd_sum, deriv + simd_deriv);
         }
@@ -1034,7 +1135,7 @@ mod tests {
             // Test NEON implementation on ARM
             #[cfg(target_arch = "aarch64")]
             {
-                let neon_npv = test_npv_implementation::<NeonOps>(values, rate);
+                let neon_npv = unsafe { npv_simd_neon(1.0 + rate, values, true) };
                 assert!(
                     (neon_npv - ref_npv).abs() < 1e-6,
                     "NEON NPV failed for len {}: got {}, expected {}",
@@ -1043,7 +1144,7 @@ mod tests {
                     ref_npv
                 );
 
-                let (neon_sum, neon_deriv) = test_npv_deriv_implementation::<NeonOps>(values, rate);
+                let (neon_sum, neon_deriv) = unsafe { npv_with_deriv_neon(rate, values, 0) };
                 assert!(
                     (neon_sum - ref_sum).abs() < 1e-6 && (neon_deriv - ref_deriv).abs() < 1e-6,
                     "NEON NPV+deriv failed for len {}",
@@ -1116,7 +1217,7 @@ mod tests {
 
             #[cfg(target_arch = "aarch64")]
             {
-                let neon_npv = unsafe { npv_simd_generic::<NeonOps>(base, values, false) };
+                let neon_npv = unsafe { npv_simd_neon(base, values, false) };
                 assert!(
                     (neon_npv - ref_npv).abs() < 1e-6,
                     "NEON NPV(non-zero start) failed for len {}: got {}, expected {}",
@@ -1182,7 +1283,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             {
                 let (neon_sum, neon_deriv) =
-                    unsafe { npv_with_deriv_generic::<NeonOps>(rate, values, start_index) };
+                    unsafe { npv_with_deriv_neon(rate, values, start_index) };
                 assert!(
                     (neon_sum - ref_sum).abs() < 1e-6 && (neon_deriv - ref_deriv).abs() < 1e-6,
                     "NEON NPV+deriv with start_index failed for len {}",
@@ -1385,6 +1486,99 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The rewritten NEON kernels must agree with the scalar reference at every length:
+    /// below the 8-lane block, exactly on a block boundary, and at each of the seven
+    /// possible remainders — which on NEON split into up to three whole pairs plus a
+    /// single scalar element.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_kernels_match_reference() {
+        for &rate in &[0.05, 0.12, -0.35, 0.9, 2.5, 1e-6, -0.999] {
+            let base = 1.0 + rate;
+
+            for len in 0..40usize {
+                // varied signs and magnitudes, deterministic
+                let values: Vec<f64> = (0..len)
+                    .map(|i| {
+                        let x = (i as f64 + 1.0) * 137.0357;
+                        if i % 3 == 0 {
+                            -x * 1000.0
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+
+                for &start_from_zero in &[true, false] {
+                    let got = unsafe { npv_simd_neon(base, &values, start_from_zero) };
+                    let want =
+                        unsafe { npv_simd_generic::<AutoVecOps>(base, &values, start_from_zero) };
+                    let tol = 1e-9 * want.abs().max(1.0);
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "npv mismatch: rate {rate}, len {len}, start_from_zero {start_from_zero}: got {got}, want {want}"
+                    );
+                }
+
+                for &start_index in &[0usize, 1, 5] {
+                    let (got_sum, got_deriv) =
+                        unsafe { npv_with_deriv_neon(rate, &values, start_index) };
+                    let (want_sum, want_deriv) =
+                        unsafe { npv_with_deriv_generic::<AutoVecOps>(rate, &values, start_index) };
+
+                    let sum_tol = 1e-9 * want_sum.abs().max(1.0);
+                    let deriv_tol = 1e-9 * want_deriv.abs().max(1.0);
+                    assert!(
+                        (got_sum - want_sum).abs() <= sum_tol,
+                        "deriv-sum mismatch: rate {rate}, len {len}, start_index {start_index}: got {got_sum}, want {want_sum}"
+                    );
+                    assert!(
+                        (got_deriv - want_deriv).abs() <= deriv_tol,
+                        "deriv mismatch: rate {rate}, len {len}, start_index {start_index}: got {got_deriv}, want {want_deriv}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Long series: the reciprocal-power chain accumulates error over the whole slice, so
+    /// check it stays negligible rather than assuming it does.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_kernels_long_series_accuracy() {
+        let values: Vec<f64> = (0..5000)
+            .map(|i| {
+                if i == 0 {
+                    -1.0e8
+                } else {
+                    25_000.0 + (i % 7) as f64 * 13.0
+                }
+            })
+            .collect();
+
+        for &rate in &[0.004, 0.05, 0.35] {
+            let base = 1.0 + rate;
+
+            let got = unsafe { npv_simd_neon(base, &values, true) };
+            let want = get_reference_npv(&values, rate);
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "long npv drift: rate {rate}: got {got}, want {want}"
+            );
+
+            let (got_sum, got_deriv) = unsafe { npv_with_deriv_neon(rate, &values[1..], 1) };
+            let (want_sum, want_deriv) = get_reference_npv_deriv(&values[1..], rate, 1);
+            assert!(
+                (got_sum - want_sum).abs() <= 1e-9 * want_sum.abs().max(1.0),
+                "long deriv-sum drift: rate {rate}: got {got_sum}, want {want_sum}"
+            );
+            assert!(
+                (got_deriv - want_deriv).abs() <= 1e-9 * want_deriv.abs().max(1.0),
+                "long deriv drift: rate {rate}: got {got_deriv}, want {want_deriv}"
+            );
         }
     }
 
