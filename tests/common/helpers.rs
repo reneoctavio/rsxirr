@@ -1,7 +1,7 @@
 use std::{fs::File, io::BufReader, path::Path};
 
 use csv::ReaderBuilder;
-use time::{macros::format_description, Date};
+use time::{Date, macros::format_description};
 
 /// Loads payments from a CSV file
 #[allow(dead_code)]

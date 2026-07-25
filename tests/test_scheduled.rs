@@ -1,6 +1,6 @@
-use pyxirr::{xfv, xirr, xnfv, xnpv, DateLike};
+use pyxirr::{DateLike, xfv, xirr, xnfv, xnpv};
 use rstest::rstest;
-use time::{macros::date, Date};
+use time::{Date, macros::date};
 
 use crate::common::{load_payments_from_csv, split_payments};
 

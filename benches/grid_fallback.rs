@@ -4,7 +4,7 @@
 //! bracket searches find no sign change and Newton does not converge — so the grid search
 //! runs to exhaustion. Both have a real IRR just below -99.9%, outside the `[-0.999, 100]`
 //! bracket, which is precisely the region the current breakpoints cannot reach.
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use pyxirr::irr;
 
 /// n=4, root at -0.99950. The tail term is negligible at rate -0.999 but dominates as the

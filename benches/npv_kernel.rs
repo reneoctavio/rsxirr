@@ -4,7 +4,7 @@
 //! Also where the `*_MIN_LEN` thresholds are measured: run this with `ENABLE_NEON=0` (or
 //! `ENABLE_AVX2=0 ENABLE_AVX=0`) to time the auto-vectorized fallback at each length, then
 //! with the kernels on, and take the crossover.
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use pyxirr::{irr, npv};
 
 fn cash_flow(len: usize) -> Vec<f64> {

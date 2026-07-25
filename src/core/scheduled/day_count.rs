@@ -1,8 +1,8 @@
 use std::{cmp::min, fmt, str::FromStr};
 
 use time::{
-    util::{days_in_month, is_leap_year},
     Date, Month,
+    util::{days_in_month, is_leap_year},
 };
 
 #[derive(Debug, Clone, Copy)]

@@ -1,6 +1,6 @@
-use super::{year_fraction, DayCount};
+use super::{DayCount, year_fraction};
 use crate::core::{
-    models::{validate, validate_length, DateLike, InvalidPaymentsError},
+    models::{DateLike, InvalidPaymentsError, validate, validate_length},
     optimize::{brentq, newton_raphson_2},
     utils::{fast_pow, initial_guess},
 };

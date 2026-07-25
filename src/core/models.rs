@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, str::FromStr};
 
-use time::{macros::format_description, Date};
+use time::{Date, macros::format_description};
 
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 pub struct DateLike(Date);
