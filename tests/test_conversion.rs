@@ -1,4 +1,4 @@
-use pyxirr::{xirr, DateLike};
+use pyxirr::{DateLike, xirr};
 use rstest::rstest;
 use time::macros::date;
 

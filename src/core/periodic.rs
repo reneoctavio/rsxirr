@@ -2,7 +2,7 @@ mod irr;
 mod npv;
 
 use super::{
-    models::{validate, InvalidPaymentsError},
+    models::{InvalidPaymentsError, validate},
     optimize::{
         brentq, brentq_grid_search, newton_raphson_2, newton_raphson_warm,
         newton_raphson_with_default_deriv,
@@ -566,13 +566,13 @@ pub fn mirr(
 
     let positive: f64 = powers(1. + reinvest_rate, values.len(), true)
         .zip(values.iter().rev())
-        .filter(|(_r, &v)| v > 0.0)
+        .filter(|&(_, v)| *v > 0.0)
         .map(|(r, v)| v * r)
         .sum();
 
     let negative: f64 = powers(1. + finance_rate, values.len(), true)
         .zip(values.iter())
-        .filter(|(_r, &v)| v < 0.0)
+        .filter(|&(_, v)| *v < 0.0)
         .map(|(r, &v)| v / r)
         .sum();
 

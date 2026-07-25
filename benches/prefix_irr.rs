@@ -1,7 +1,7 @@
 //! Mirrors the consumer workload that motivated this work: an IRR series, where
 //! `irr` is called once per prefix of a cash flow. Consecutive prefixes have very
 //! similar rates, so the previous result is a near-perfect guess for the next one.
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use pyxirr::irr;
 
 #[path = "../tests/common/mod.rs"]

@@ -165,57 +165,63 @@ macro_rules! define_simd256_kernels {
         /// division becomes a multiply, and there is exactly one horizontal reduction at the end.
         #[target_feature(enable = $feature)]
         unsafe fn $npv(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-            use std::arch::x86_64::*;
+            // SAFETY: reached only via `simd_tier`, which checked this CPU supports
+            // `$feature`. Every load is in bounds: the block loop stops at
+            // `blocks * SIMD256_BLOCK <= values.len()`, the 4-wide remainder step is guarded
+            // by `values.len() - i >= 4`, and the scalar tail by `i < values.len()`.
+            unsafe {
+                use std::arch::x86_64::*;
 
-            let inv_base = 1.0 / base;
-            let ib2 = inv_base * inv_base;
-            let ib3 = ib2 * inv_base;
-            let ib4 = ib2 * ib2;
+                let inv_base = 1.0 / base;
+                let ib2 = inv_base * inv_base;
+                let ib3 = ib2 * inv_base;
+                let ib4 = ib2 * ib2;
 
-            // discount factor of the first element: base^0 or base^-1
-            let p0 = if start_from_zero {
-                1.0
-            } else {
-                inv_base
-            };
+                // discount factor of the first element: base^0 or base^-1
+                let p0 = if start_from_zero {
+                    1.0
+                } else {
+                    inv_base
+                };
 
-            let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
-            let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
-            let step = _mm256_set1_pd(ib4 * ib4);
+                let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
+                let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+                let step = _mm256_set1_pd(ib4 * ib4);
 
-            let mut acc_lo = _mm256_setzero_pd();
-            let mut acc_hi = _mm256_setzero_pd();
+                let mut acc_lo = _mm256_setzero_pd();
+                let mut acc_hi = _mm256_setzero_pd();
 
-            let ptr = values.as_ptr();
-            let blocks = values.len() / SIMD256_BLOCK;
+                let ptr = values.as_ptr();
+                let blocks = values.len() / SIMD256_BLOCK;
 
-            for k in 0..blocks {
-                let i = k * SIMD256_BLOCK;
-                acc_lo = $madd!(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
-                acc_hi = $madd!(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi, acc_hi);
-                pow_lo = _mm256_mul_pd(pow_lo, step);
-                pow_hi = _mm256_mul_pd(pow_hi, step);
+                for k in 0..blocks {
+                    let i = k * SIMD256_BLOCK;
+                    acc_lo = $madd!(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
+                    acc_hi = $madd!(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi, acc_hi);
+                    pow_lo = _mm256_mul_pd(pow_lo, step);
+                    pow_hi = _mm256_mul_pd(pow_hi, step);
+                }
+
+                // A remainder of 4 or more is still worth a vector step; only the last 0-3 go scalar.
+                let mut i = blocks * SIMD256_BLOCK;
+                if values.len() - i >= 4 {
+                    acc_lo = $madd!(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
+                    pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+                    i += 4;
+                }
+
+                let mut sum = hsum_pd(_mm256_add_pd(acc_lo, acc_hi));
+
+                // lane 0 of pow_lo is the discount factor of the next unprocessed element
+                let mut power = _mm256_cvtsd_f64(pow_lo);
+                while i < values.len() {
+                    sum += *ptr.add(i) * power;
+                    power *= inv_base;
+                    i += 1;
+                }
+
+                sum
             }
-
-            // A remainder of 4 or more is still worth a vector step; only the last 0-3 go scalar.
-            let mut i = blocks * SIMD256_BLOCK;
-            if values.len() - i >= 4 {
-                acc_lo = $madd!(_mm256_loadu_pd(ptr.add(i)), pow_lo, acc_lo);
-                pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
-                i += 4;
-            }
-
-            let mut sum = hsum_pd(_mm256_add_pd(acc_lo, acc_hi));
-
-            // lane 0 of pow_lo is the discount factor of the next unprocessed element
-            let mut power = _mm256_cvtsd_f64(pow_lo);
-            while i < values.len() {
-                sum += *ptr.add(i) * power;
-                power *= inv_base;
-                i += 1;
-            }
-
-            sum
         }
 
         /// NPV and its derivative over the whole slice in one pass.
@@ -225,78 +231,84 @@ macro_rules! define_simd256_kernels {
         /// factor common to every derivative term is applied once at the end instead of per element.
         #[target_feature(enable = $feature)]
         unsafe fn $npv_deriv(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-            use std::arch::x86_64::*;
+            // SAFETY: reached only via `simd_tier`, which checked this CPU supports
+            // `$feature`. Every load is in bounds: the block loop stops at
+            // `blocks * SIMD256_BLOCK <= values.len()`, the 4-wide remainder step is guarded
+            // by `values.len() - i >= 4`, and the scalar tail by `i < values.len()`.
+            unsafe {
+                use std::arch::x86_64::*;
 
-            let base = 1.0 + rate;
-            let inv_base = 1.0 / base;
-            let ib2 = inv_base * inv_base;
-            let ib3 = ib2 * inv_base;
-            let ib4 = ib2 * ib2;
+                let base = 1.0 + rate;
+                let inv_base = 1.0 / base;
+                let ib2 = inv_base * inv_base;
+                let ib3 = ib2 * inv_base;
+                let ib4 = ib2 * ib2;
 
-            // Matches `npv_with_deriv_autovec`: the discount exponent starts at 1 whatever
-            // `start_index` is — the caller has already handled element 0 — while `start_index`
-            // only feeds the derivative's index weights. The two coincide for the production
-            // call, which passes `&values[1..]` with `start_index == 1`.
-            let p0 = inv_base;
+                // Matches `npv_with_deriv_autovec`: the discount exponent starts at 1 whatever
+                // `start_index` is — the caller has already handled element 0 — while `start_index`
+                // only feeds the derivative's index weights. The two coincide for the production
+                // call, which passes `&values[1..]` with `start_index == 1`.
+                let p0 = inv_base;
 
-            let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
-            let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
-            let step = _mm256_set1_pd(ib4 * ib4);
+                let mut pow_lo = _mm256_set_pd(p0 * ib3, p0 * ib2, p0 * inv_base, p0);
+                let mut pow_hi = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+                let step = _mm256_set1_pd(ib4 * ib4);
 
-            let si = start_index as f64;
-            let mut idx_lo = _mm256_set_pd(si + 3.0, si + 2.0, si + 1.0, si);
-            let mut idx_hi = _mm256_add_pd(idx_lo, _mm256_set1_pd(4.0));
-            let idx_step = _mm256_set1_pd(SIMD256_BLOCK as f64);
+                let si = start_index as f64;
+                let mut idx_lo = _mm256_set_pd(si + 3.0, si + 2.0, si + 1.0, si);
+                let mut idx_hi = _mm256_add_pd(idx_lo, _mm256_set1_pd(4.0));
+                let idx_step = _mm256_set1_pd(SIMD256_BLOCK as f64);
 
-            let mut sum_lo = _mm256_setzero_pd();
-            let mut sum_hi = _mm256_setzero_pd();
-            // accumulates sum(i * v_i / base^i); scaled by -1/base once the loop is done
-            let mut deriv_lo = _mm256_setzero_pd();
-            let mut deriv_hi = _mm256_setzero_pd();
+                let mut sum_lo = _mm256_setzero_pd();
+                let mut sum_hi = _mm256_setzero_pd();
+                // accumulates sum(i * v_i / base^i); scaled by -1/base once the loop is done
+                let mut deriv_lo = _mm256_setzero_pd();
+                let mut deriv_hi = _mm256_setzero_pd();
 
-            let ptr = values.as_ptr();
-            let blocks = values.len() / SIMD256_BLOCK;
+                let ptr = values.as_ptr();
+                let blocks = values.len() / SIMD256_BLOCK;
 
-            for k in 0..blocks {
-                let i = k * SIMD256_BLOCK;
+                for k in 0..blocks {
+                    let i = k * SIMD256_BLOCK;
 
-                let term_lo = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
-                let term_hi = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi);
+                    let term_lo = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
+                    let term_hi = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i + 4)), pow_hi);
 
-                sum_lo = _mm256_add_pd(sum_lo, term_lo);
-                sum_hi = _mm256_add_pd(sum_hi, term_hi);
+                    sum_lo = _mm256_add_pd(sum_lo, term_lo);
+                    sum_hi = _mm256_add_pd(sum_hi, term_hi);
 
-                deriv_lo = $madd!(term_lo, idx_lo, deriv_lo);
-                deriv_hi = $madd!(term_hi, idx_hi, deriv_hi);
+                    deriv_lo = $madd!(term_lo, idx_lo, deriv_lo);
+                    deriv_hi = $madd!(term_hi, idx_hi, deriv_hi);
 
-                pow_lo = _mm256_mul_pd(pow_lo, step);
-                pow_hi = _mm256_mul_pd(pow_hi, step);
-                idx_lo = _mm256_add_pd(idx_lo, idx_step);
-                idx_hi = _mm256_add_pd(idx_hi, idx_step);
+                    pow_lo = _mm256_mul_pd(pow_lo, step);
+                    pow_hi = _mm256_mul_pd(pow_hi, step);
+                    idx_lo = _mm256_add_pd(idx_lo, idx_step);
+                    idx_hi = _mm256_add_pd(idx_hi, idx_step);
+                }
+
+                let mut i = blocks * SIMD256_BLOCK;
+                if values.len() - i >= 4 {
+                    let term = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
+                    sum_lo = _mm256_add_pd(sum_lo, term);
+                    deriv_lo = $madd!(term, idx_lo, deriv_lo);
+                    pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
+                    i += 4;
+                }
+
+                let mut sum = hsum_pd(_mm256_add_pd(sum_lo, sum_hi));
+                let mut weighted = hsum_pd(_mm256_add_pd(deriv_lo, deriv_hi));
+
+                let mut power = _mm256_cvtsd_f64(pow_lo);
+                while i < values.len() {
+                    let term = *ptr.add(i) * power;
+                    sum += term;
+                    weighted += (start_index + i) as f64 * term;
+                    power *= inv_base;
+                    i += 1;
+                }
+
+                (sum, -weighted * inv_base)
             }
-
-            let mut i = blocks * SIMD256_BLOCK;
-            if values.len() - i >= 4 {
-                let term = _mm256_mul_pd(_mm256_loadu_pd(ptr.add(i)), pow_lo);
-                sum_lo = _mm256_add_pd(sum_lo, term);
-                deriv_lo = $madd!(term, idx_lo, deriv_lo);
-                pow_lo = _mm256_mul_pd(pow_lo, _mm256_set1_pd(ib4));
-                i += 4;
-            }
-
-            let mut sum = hsum_pd(_mm256_add_pd(sum_lo, sum_hi));
-            let mut weighted = hsum_pd(_mm256_add_pd(deriv_lo, deriv_hi));
-
-            let mut power = _mm256_cvtsd_f64(pow_lo);
-            while i < values.len() {
-                let term = *ptr.add(i) * power;
-                sum += term;
-                weighted += (start_index + i) as f64 * term;
-                power *= inv_base;
-                i += 1;
-            }
-
-            (sum, -weighted * inv_base)
         }
     };
 }
@@ -337,78 +349,84 @@ const NEON_DERIV_MIN_LEN: usize = NEON_BLOCK + 1;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn npv_simd_neon(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
-    use std::arch::aarch64::*;
+    // SAFETY: NEON is mandatory in the aarch64 base ISA, so the target feature is
+    // always satisfied. Every load is in bounds: the block loop stops at
+    // `blocks * NEON_BLOCK <= len`, each of the three pair steps is guarded by
+    // `len - i >= 2`, and the final single element by `i < len`.
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let inv_base = 1.0 / base;
-    let ib2 = inv_base * inv_base;
-    let ib4 = ib2 * ib2;
-    let ib8 = ib4 * ib4;
+        let inv_base = 1.0 / base;
+        let ib2 = inv_base * inv_base;
+        let ib4 = ib2 * ib2;
+        let ib8 = ib4 * ib4;
 
-    // discount factor of the first element: base^0 or base^-1
-    let p0 = if start_from_zero {
-        1.0
-    } else {
-        inv_base
-    };
+        // discount factor of the first element: base^0 or base^-1
+        let p0 = if start_from_zero {
+            1.0
+        } else {
+            inv_base
+        };
 
-    // pow_j carries the factors of elements i + 2j and i + 2j + 1
-    let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
-    let mut pow1 = vmulq_n_f64(pow0, ib2);
-    let mut pow2 = vmulq_n_f64(pow0, ib4);
-    let mut pow3 = vmulq_n_f64(pow1, ib4);
-    let step = vdupq_n_f64(ib8);
+        // pow_j carries the factors of elements i + 2j and i + 2j + 1
+        let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
+        let mut pow1 = vmulq_n_f64(pow0, ib2);
+        let mut pow2 = vmulq_n_f64(pow0, ib4);
+        let mut pow3 = vmulq_n_f64(pow1, ib4);
+        let step = vdupq_n_f64(ib8);
 
-    let mut acc0 = vdupq_n_f64(0.0);
-    let mut acc1 = vdupq_n_f64(0.0);
-    let mut acc2 = vdupq_n_f64(0.0);
-    let mut acc3 = vdupq_n_f64(0.0);
+        let mut acc0 = vdupq_n_f64(0.0);
+        let mut acc1 = vdupq_n_f64(0.0);
+        let mut acc2 = vdupq_n_f64(0.0);
+        let mut acc3 = vdupq_n_f64(0.0);
 
-    let ptr = values.as_ptr();
-    let len = values.len();
-    let blocks = len / NEON_BLOCK;
+        let ptr = values.as_ptr();
+        let len = values.len();
+        let blocks = len / NEON_BLOCK;
 
-    for k in 0..blocks {
-        let i = k * NEON_BLOCK;
-        acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
-        acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i + 2)), pow1);
-        acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i + 4)), pow2);
-        acc3 = vfmaq_f64(acc3, vld1q_f64(ptr.add(i + 6)), pow3);
-        pow0 = vmulq_f64(pow0, step);
-        pow1 = vmulq_f64(pow1, step);
-        pow2 = vmulq_f64(pow2, step);
-        pow3 = vmulq_f64(pow3, step);
+        for k in 0..blocks {
+            let i = k * NEON_BLOCK;
+            acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
+            acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i + 2)), pow1);
+            acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i + 4)), pow2);
+            acc3 = vfmaq_f64(acc3, vld1q_f64(ptr.add(i + 6)), pow3);
+            pow0 = vmulq_f64(pow0, step);
+            pow1 = vmulq_f64(pow1, step);
+            pow2 = vmulq_f64(pow2, step);
+            pow3 = vmulq_f64(pow3, step);
+        }
+
+        // Up to three whole pairs are left over; each already has its factors in pow_j, so the
+        // remainder costs no extra power arithmetic. `tail_pow` tracks the vector whose lane 0
+        // is the factor of the next unprocessed element.
+        let mut i = blocks * NEON_BLOCK;
+        let mut tail_pow = pow0;
+        if len - i >= 2 {
+            acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
+            i += 2;
+            tail_pow = pow1;
+        }
+        if len - i >= 2 {
+            acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i)), pow1);
+            i += 2;
+            tail_pow = pow2;
+        }
+        if len - i >= 2 {
+            acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i)), pow2);
+            i += 2;
+            tail_pow = pow3;
+        }
+
+        let acc = vaddq_f64(vaddq_f64(acc0, acc1), vaddq_f64(acc2, acc3));
+        let mut sum = vaddvq_f64(acc);
+
+        // at most one element left
+        if i < len {
+            sum += *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
+        }
+
+        sum
     }
-
-    // Up to three whole pairs are left over; each already has its factors in pow_j, so the
-    // remainder costs no extra power arithmetic. `tail_pow` tracks the vector whose lane 0
-    // is the factor of the next unprocessed element.
-    let mut i = blocks * NEON_BLOCK;
-    let mut tail_pow = pow0;
-    if len - i >= 2 {
-        acc0 = vfmaq_f64(acc0, vld1q_f64(ptr.add(i)), pow0);
-        i += 2;
-        tail_pow = pow1;
-    }
-    if len - i >= 2 {
-        acc1 = vfmaq_f64(acc1, vld1q_f64(ptr.add(i)), pow1);
-        i += 2;
-        tail_pow = pow2;
-    }
-    if len - i >= 2 {
-        acc2 = vfmaq_f64(acc2, vld1q_f64(ptr.add(i)), pow2);
-        i += 2;
-        tail_pow = pow3;
-    }
-
-    let acc = vaddq_f64(vaddq_f64(acc0, acc1), vaddq_f64(acc2, acc3));
-    let mut sum = vaddvq_f64(acc);
-
-    // at most one element left
-    if i < len {
-        sum += *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
-    }
-
-    sum
 }
 
 /// NPV and its derivative over the whole slice in one pass.
@@ -419,111 +437,117 @@ unsafe fn npv_simd_neon(base: f64, values: &[f64], start_from_zero: bool) -> f64
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn npv_with_deriv_neon(rate: f64, values: &[f64], start_index: usize) -> (f64, f64) {
-    use std::arch::aarch64::*;
+    // SAFETY: NEON is mandatory in the aarch64 base ISA, so the target feature is
+    // always satisfied. Every load is in bounds: the block loop stops at
+    // `blocks * NEON_BLOCK <= len`, each of the three pair steps is guarded by
+    // `len - i >= 2`, and the final single element by `i < len`.
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let base = 1.0 + rate;
-    let inv_base = 1.0 / base;
-    let ib2 = inv_base * inv_base;
-    let ib4 = ib2 * ib2;
-    let ib8 = ib4 * ib4;
+        let base = 1.0 + rate;
+        let inv_base = 1.0 / base;
+        let ib2 = inv_base * inv_base;
+        let ib4 = ib2 * ib2;
+        let ib8 = ib4 * ib4;
 
-    // Matches `npv_with_deriv_autovec`: the discount exponent starts at 1 whatever
-    // `start_index` is — the caller has already handled element 0 — while `start_index`
-    // only feeds the derivative's index weights. The two coincide for the production
-    // call, which passes `&values[1..]` with `start_index == 1`.
-    let p0 = inv_base;
+        // Matches `npv_with_deriv_autovec`: the discount exponent starts at 1 whatever
+        // `start_index` is — the caller has already handled element 0 — while `start_index`
+        // only feeds the derivative's index weights. The two coincide for the production
+        // call, which passes `&values[1..]` with `start_index == 1`.
+        let p0 = inv_base;
 
-    let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
-    let mut pow1 = vmulq_n_f64(pow0, ib2);
-    let mut pow2 = vmulq_n_f64(pow0, ib4);
-    let mut pow3 = vmulq_n_f64(pow1, ib4);
-    let step = vdupq_n_f64(ib8);
+        let mut pow0 = vcombine_f64(vdup_n_f64(p0), vdup_n_f64(p0 * inv_base));
+        let mut pow1 = vmulq_n_f64(pow0, ib2);
+        let mut pow2 = vmulq_n_f64(pow0, ib4);
+        let mut pow3 = vmulq_n_f64(pow1, ib4);
+        let step = vdupq_n_f64(ib8);
 
-    let si = start_index as f64;
-    let mut idx0 = vcombine_f64(vdup_n_f64(si), vdup_n_f64(si + 1.0));
-    let mut idx1 = vaddq_f64(idx0, vdupq_n_f64(2.0));
-    let mut idx2 = vaddq_f64(idx0, vdupq_n_f64(4.0));
-    let mut idx3 = vaddq_f64(idx0, vdupq_n_f64(6.0));
-    let idx_step = vdupq_n_f64(NEON_BLOCK as f64);
+        let si = start_index as f64;
+        let mut idx0 = vcombine_f64(vdup_n_f64(si), vdup_n_f64(si + 1.0));
+        let mut idx1 = vaddq_f64(idx0, vdupq_n_f64(2.0));
+        let mut idx2 = vaddq_f64(idx0, vdupq_n_f64(4.0));
+        let mut idx3 = vaddq_f64(idx0, vdupq_n_f64(6.0));
+        let idx_step = vdupq_n_f64(NEON_BLOCK as f64);
 
-    let mut sum0 = vdupq_n_f64(0.0);
-    let mut sum1 = vdupq_n_f64(0.0);
-    let mut sum2 = vdupq_n_f64(0.0);
-    let mut sum3 = vdupq_n_f64(0.0);
-    // accumulate sum(i * v_i / base^i); scaled by -1/base once the loop is done
-    let mut wgt0 = vdupq_n_f64(0.0);
-    let mut wgt1 = vdupq_n_f64(0.0);
-    let mut wgt2 = vdupq_n_f64(0.0);
-    let mut wgt3 = vdupq_n_f64(0.0);
+        let mut sum0 = vdupq_n_f64(0.0);
+        let mut sum1 = vdupq_n_f64(0.0);
+        let mut sum2 = vdupq_n_f64(0.0);
+        let mut sum3 = vdupq_n_f64(0.0);
+        // accumulate sum(i * v_i / base^i); scaled by -1/base once the loop is done
+        let mut wgt0 = vdupq_n_f64(0.0);
+        let mut wgt1 = vdupq_n_f64(0.0);
+        let mut wgt2 = vdupq_n_f64(0.0);
+        let mut wgt3 = vdupq_n_f64(0.0);
 
-    let ptr = values.as_ptr();
-    let len = values.len();
-    let blocks = len / NEON_BLOCK;
+        let ptr = values.as_ptr();
+        let len = values.len();
+        let blocks = len / NEON_BLOCK;
 
-    for k in 0..blocks {
-        let i = k * NEON_BLOCK;
+        for k in 0..blocks {
+            let i = k * NEON_BLOCK;
 
-        let term0 = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
-        let term1 = vmulq_f64(vld1q_f64(ptr.add(i + 2)), pow1);
-        let term2 = vmulq_f64(vld1q_f64(ptr.add(i + 4)), pow2);
-        let term3 = vmulq_f64(vld1q_f64(ptr.add(i + 6)), pow3);
+            let term0 = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
+            let term1 = vmulq_f64(vld1q_f64(ptr.add(i + 2)), pow1);
+            let term2 = vmulq_f64(vld1q_f64(ptr.add(i + 4)), pow2);
+            let term3 = vmulq_f64(vld1q_f64(ptr.add(i + 6)), pow3);
 
-        sum0 = vaddq_f64(sum0, term0);
-        sum1 = vaddq_f64(sum1, term1);
-        sum2 = vaddq_f64(sum2, term2);
-        sum3 = vaddq_f64(sum3, term3);
+            sum0 = vaddq_f64(sum0, term0);
+            sum1 = vaddq_f64(sum1, term1);
+            sum2 = vaddq_f64(sum2, term2);
+            sum3 = vaddq_f64(sum3, term3);
 
-        wgt0 = vfmaq_f64(wgt0, term0, idx0);
-        wgt1 = vfmaq_f64(wgt1, term1, idx1);
-        wgt2 = vfmaq_f64(wgt2, term2, idx2);
-        wgt3 = vfmaq_f64(wgt3, term3, idx3);
+            wgt0 = vfmaq_f64(wgt0, term0, idx0);
+            wgt1 = vfmaq_f64(wgt1, term1, idx1);
+            wgt2 = vfmaq_f64(wgt2, term2, idx2);
+            wgt3 = vfmaq_f64(wgt3, term3, idx3);
 
-        pow0 = vmulq_f64(pow0, step);
-        pow1 = vmulq_f64(pow1, step);
-        pow2 = vmulq_f64(pow2, step);
-        pow3 = vmulq_f64(pow3, step);
+            pow0 = vmulq_f64(pow0, step);
+            pow1 = vmulq_f64(pow1, step);
+            pow2 = vmulq_f64(pow2, step);
+            pow3 = vmulq_f64(pow3, step);
 
-        idx0 = vaddq_f64(idx0, idx_step);
-        idx1 = vaddq_f64(idx1, idx_step);
-        idx2 = vaddq_f64(idx2, idx_step);
-        idx3 = vaddq_f64(idx3, idx_step);
+            idx0 = vaddq_f64(idx0, idx_step);
+            idx1 = vaddq_f64(idx1, idx_step);
+            idx2 = vaddq_f64(idx2, idx_step);
+            idx3 = vaddq_f64(idx3, idx_step);
+        }
+
+        let mut i = blocks * NEON_BLOCK;
+        let mut tail_pow = pow0;
+        if len - i >= 2 {
+            let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
+            sum0 = vaddq_f64(sum0, term);
+            wgt0 = vfmaq_f64(wgt0, term, idx0);
+            i += 2;
+            tail_pow = pow1;
+        }
+        if len - i >= 2 {
+            let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow1);
+            sum1 = vaddq_f64(sum1, term);
+            wgt1 = vfmaq_f64(wgt1, term, idx1);
+            i += 2;
+            tail_pow = pow2;
+        }
+        if len - i >= 2 {
+            let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow2);
+            sum2 = vaddq_f64(sum2, term);
+            wgt2 = vfmaq_f64(wgt2, term, idx2);
+            i += 2;
+            tail_pow = pow3;
+        }
+
+        let mut sum = vaddvq_f64(vaddq_f64(vaddq_f64(sum0, sum1), vaddq_f64(sum2, sum3)));
+        let mut weighted = vaddvq_f64(vaddq_f64(vaddq_f64(wgt0, wgt1), vaddq_f64(wgt2, wgt3)));
+
+        // at most one element left
+        if i < len {
+            let term = *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
+            sum += term;
+            weighted += (start_index + i) as f64 * term;
+        }
+
+        (sum, -weighted * inv_base)
     }
-
-    let mut i = blocks * NEON_BLOCK;
-    let mut tail_pow = pow0;
-    if len - i >= 2 {
-        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow0);
-        sum0 = vaddq_f64(sum0, term);
-        wgt0 = vfmaq_f64(wgt0, term, idx0);
-        i += 2;
-        tail_pow = pow1;
-    }
-    if len - i >= 2 {
-        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow1);
-        sum1 = vaddq_f64(sum1, term);
-        wgt1 = vfmaq_f64(wgt1, term, idx1);
-        i += 2;
-        tail_pow = pow2;
-    }
-    if len - i >= 2 {
-        let term = vmulq_f64(vld1q_f64(ptr.add(i)), pow2);
-        sum2 = vaddq_f64(sum2, term);
-        wgt2 = vfmaq_f64(wgt2, term, idx2);
-        i += 2;
-        tail_pow = pow3;
-    }
-
-    let mut sum = vaddvq_f64(vaddq_f64(vaddq_f64(sum0, sum1), vaddq_f64(sum2, sum3)));
-    let mut weighted = vaddvq_f64(vaddq_f64(vaddq_f64(wgt0, wgt1), vaddq_f64(wgt2, wgt3)));
-
-    // at most one element left
-    if i < len {
-        let term = *ptr.add(i) * vgetq_lane_f64::<0>(tail_pow);
-        sum += term;
-        weighted += (start_index + i) as f64 * term;
-    }
-
-    (sum, -weighted * inv_base)
 }
 
 /// SIMD tier selected once per process from CPU support + the `ENABLE_*` overrides.
