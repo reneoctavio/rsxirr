@@ -1,8 +1,15 @@
 /// CPU support for the AVX2+FMA tier. Kept as a free function rather than a method on a
 /// per-tier type: dispatch and the kernel tests are the only callers.
+///
+/// `avx` is checked alongside `avx2` and `fma` because the AVX2 kernels call `hsum_pd`,
+/// which is an AVX-level `#[target_feature]` function — that is a real precondition of
+/// entering this tier, so it is tested rather than assumed. No CPU exposes AVX2 without
+/// AVX, but the check costs nothing: `simd_tier` resolves this once and caches it.
 #[cfg(target_arch = "x86_64")]
 fn avx2_supported() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
 }
 
 /// CPU support for the plain-AVX tier.
@@ -106,6 +113,13 @@ const SIMD256_BLOCK: usize = 8;
 /// fallback. Measured, not assumed — see `benches/npv_kernel.rs`.
 #[cfg(target_arch = "x86_64")]
 const SIMD256_MIN_LEN: usize = 6;
+
+/// The same threshold for the NPV+derivative kernels, which is higher: those set up eight
+/// vectors (two discount-factor chains, two index chains, two sum and two weight
+/// accumulators) before the first multiply. Mirrors `NEON_DERIV_MIN_LEN`. The kernel is
+/// handed `&values[1..]`, so a slice of this length gives it exactly one block.
+#[cfg(target_arch = "x86_64")]
+const SIMD256_DERIV_MIN_LEN: usize = SIMD256_BLOCK + 1;
 
 /// Horizontal sum of a 4-wide vector. Done once at the end of a kernel, never per chunk.
 #[cfg(target_arch = "x86_64")]
@@ -603,7 +617,7 @@ pub fn npv_with_deriv_simd(rate: f64, values: &[f64]) -> (f64, f64) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if values.len() >= SIMD256_MIN_LEN {
+        if values.len() >= SIMD256_DERIV_MIN_LEN {
             match simd_tier() {
                 SimdTier::Avx2 => {
                     let (simd_sum, simd_deriv) =
@@ -1067,6 +1081,48 @@ mod tests {
             );
 
             let (got_sum, got_deriv) = unsafe { npv_with_deriv_avx2(rate, &values[1..], 1) };
+            let (want_sum, want_deriv) = get_reference_npv_deriv(&values[1..], rate, 1);
+            assert!(
+                (got_sum - want_sum).abs() <= 1e-9 * want_sum.abs().max(1.0),
+                "long deriv-sum drift: rate {rate}: got {got_sum}, want {want_sum}"
+            );
+            assert!(
+                (got_deriv - want_deriv).abs() <= 1e-9 * want_deriv.abs().max(1.0),
+                "long deriv drift: rate {rate}: got {got_deriv}, want {want_deriv}"
+            );
+        }
+    }
+    /// Same for the plain-AVX tier. Worth its own case rather than trusting the AVX2 one:
+    /// without FMA each accumulate rounds twice, so the drift over 5000 elements is a
+    /// genuinely different quantity.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx_kernels_long_series_accuracy() {
+        if !avx_supported() {
+            return;
+        }
+
+        let values: Vec<f64> = (0..5000)
+            .map(|i| {
+                if i == 0 {
+                    -1.0e8
+                } else {
+                    25_000.0 + (i % 7) as f64 * 13.0
+                }
+            })
+            .collect();
+
+        for &rate in &[0.004, 0.05, 0.35] {
+            let base = 1.0 + rate;
+
+            let got = unsafe { npv_simd_avx(base, &values, true) };
+            let want = get_reference_npv(&values, rate);
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "long npv drift: rate {rate}: got {got}, want {want}"
+            );
+
+            let (got_sum, got_deriv) = unsafe { npv_with_deriv_avx(rate, &values[1..], 1) };
             let (want_sum, want_deriv) = get_reference_npv_deriv(&values[1..], rate, 1);
             assert!(
                 (got_sum - want_sum).abs() <= 1e-9 * want_sum.abs().max(1.0),
