@@ -7,194 +7,38 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-env:
-  MATURIN_VERSION: 1.7.4
-
 jobs:
-  test:
+  check:
+    name: Format and lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Test no numpy
-        run: cargo test --release --features nonumpy
-      - name: Install numpy v1
-        run: pip install 'numpy>=1,<2' 'pandas>=1,<2'
-      - name: Test numpy v1
-        run: cargo test --release
-      - name: Install numpy v2
-        run: pip install 'numpy>=2,<3' 'pandas>=2,<3'
-      - name: Test numpy v2
-        run: cargo test --release
+          components: rustfmt, clippy
+          target: aarch64-unknown-linux-gnu
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # The NEON kernels sit behind cfg(target_arch = "aarch64"), so the x86 steps above
+      # never compile them. Without this step they are type-checked and linted by nothing
+      # -- which is how they missed the 2024 edition migration.
+      - name: Clippy (aarch64, compiles the NEON kernels)
+        run: cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
 
-  build:
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: test
-    strategy:
-      matrix:
-        python: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
-        platform:
-          - os: ubuntu-latest
-          - os: macos-latest
-          - os: macos-latest
-            arch: aarch64
-          - os: windows-latest
-    runs-on: ${{ matrix.platform.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-          # allow-prereleases: ${{ matrix.python == "3.13" }}
-      - name: Build Wheels - Linux
-        if: matrix.platform.os == 'ubuntu-latest'
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          manylinux: auto
-          args: -i python${{ matrix.python }} --release --strip --sdist
-
-      - name: Check that the source distribution installed correctly
-        if: matrix.platform.os == 'ubuntu-latest'
-        run: pip install target/wheels/pyxirr-*.tar.gz
-
-      - name: Build Wheels - MacOS [aarch64]
-        if: ${{ matrix.platform.os == 'macos-latest' && matrix.platform.arch == 'aarch64' }}
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          args: -i python --release --target aarch64-apple-darwin --strip
-
-      - name: Build Wheels - MacOS [x86_64]
-        if: ${{ matrix.platform.os == 'macos-latest' && matrix.platform.arch != 'aarch64' }}
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          args: -i python --release --target universal2-apple-darwin --strip
-
-      - name: Build Wheels - Windows
-        if: matrix.platform.os == 'windows-latest'
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          args: -i python --release --strip
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.arch || 'x86_64' }}-${{ matrix.python }}
-          path: target/wheels
-
-  linux-cross:
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: test
+  test:
+    name: Test (${{ matrix.tier.name }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
-        target: [aarch64, armv7, s390x, ppc64le, ppc64]
-    runs-on: ubuntu-latest
+        # NPV dispatch picks the best tier the CPU supports, so a plain run only ever
+        # exercises the runner's best one. The ENABLE_* overrides force the lower tiers
+        # so the AVX and auto-vectorized kernels are covered too.
+        tier:
+          - { name: avx2, env: '' }
+          - { name: avx, env: 'ENABLE_AVX2=0' }
+          - { name: autovec, env: 'ENABLE_AVX2=0 ENABLE_AVX=0' }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          target: ${{ matrix.target }}
-          manylinux: auto
-          args: --release --strip -i python${{ matrix.python }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.target }}-${{ matrix.python }}
-          path: target/wheels
-
-  wasm-emscripten:
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: test
-    strategy:
-      matrix:
-        # https://pyodide.org/en/stable/project/changelog.html
-        version:
-          - python: '3.12'
-            emscripten: 3.1.58  # pyodide 0.26.*
-          - python: '3.11'
-            emscripten: 3.1.46  # pyodide 0.25.*
-          - python: '3.11'
-            emscripten: 3.1.45  # pyodide 0.24.*
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ matrix.version.emscripten }}
-      - uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          target: wasm32-unknown-emscripten
-          rust-toolchain: nightly
-          args: --release --strip -i python${{ matrix.version.python }}
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-wasm-emscripten-${{ matrix.version.emscripten }}
-          path: target/wheels
-
-  linux-musl:
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: test
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - i686-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Wheels - musl
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          target: ${{ matrix.target }}
-          manylinux: musllinux_1_2
-          args: --release --strip -i 3.7 3.8 3.9 3.10 3.11 3.12 3.13
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-musl-${{ matrix.target }}
-          path: target/wheels
-
-  publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs:
-      - build
-      - linux-cross
-      - linux-musl
-      - wasm-emscripten
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-
-      - run: pip install maturin
-
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: pyxirr*.whl
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: PyPI publish
-        env:
-          MATURIN_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-        # wasm excluded because pypi doesn't support wasm wheels yet
-        run: find . -name 'pyxirr*' -not -name '*wasm*' | xargs -l maturin upload --skip-existing --username __token__
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: ${{ matrix.tier.env }} cargo test --release

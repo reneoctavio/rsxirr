@@ -746,3 +746,29 @@ fn test_irr_root_below_minus_999(#[case] input: &[f64], #[case] expected: f64) {
     let scale: f64 = input.iter().map(|v| v.abs()).sum();
     assert!(npv(rate, input, Some(true)).abs() <= 1e-6 * scale);
 }
+
+/// `irr`, `xirr` and `mirr` return `Result<_, InvalidPaymentsError>`, so the error type has
+/// to be nameable from outside the crate — otherwise callers are stuck with `unwrap` and
+/// cannot propagate with `?`. This test is the export: it fails to compile if the type
+/// stops being public.
+#[rstest]
+fn test_invalid_payments_error_is_usable_by_callers() {
+    use std::error::Error;
+
+    use pyxirr::InvalidPaymentsError;
+
+    // nameable in a signature, and `?` propagates into it
+    fn compute(values: &[f64]) -> Result<f64, InvalidPaymentsError> {
+        let rate = irr(values, None)?;
+        Ok(rate)
+    }
+
+    assert!(compute(&[-100.0, 39.0, 59.0, 55.0, 20.0]).is_ok());
+
+    let err = compute(&[1.0, 2.0, 3.0]).unwrap_err();
+    assert_eq!(err.to_string(), "negative and positive payments are required");
+
+    // implements std::error::Error, so it composes with boxed and derived error types
+    let boxed: Box<dyn Error> = Box::new(err);
+    assert!(!boxed.to_string().is_empty());
+}

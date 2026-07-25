@@ -1,11 +1,11 @@
 [package]
 name = "pyxirr"
 version = "0.10.6"
-authors = ["Anexen"]
 edition = "2024"
-description = "Rust-powered collection of financial functions for Python."
+description = "Rust-powered collection of financial functions. Fork of pyxirr with the Python bindings removed."
 readme = "README.md"
-homepage = "https://github.com/Anexen/pyxirr"
+homepage = "https://github.com/reneoctavio/rsxirr"
+repository = "https://github.com/reneoctavio/rsxirr"
 license = "Unlicense"
 keywords = [
     "fast",
@@ -17,15 +17,13 @@ keywords = [
 ]
 include = [
     "src/**",
-    "docs/_inline/**",
     "Cargo.toml",
-    "pyproject.toml",
     "LICENSE",
 ]
 
 [lib]
 name = "pyxirr"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 doctest = false
 
 [dependencies]
