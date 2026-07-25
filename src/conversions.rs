@@ -18,13 +18,3 @@ impl From<i64> for DateLike {
         Date::from_julian_day(UNIX_EPOCH_JULIAN_DAY + (value as i32)).unwrap().into()
     }
 }
-
-pub struct AmountArray(Vec<f64>);
-
-impl std::ops::Deref for AmountArray {
-    type Target = [f64];
-
-    fn deref(&self) -> &[f64] {
-        self.0.as_ref()
-    }
-}

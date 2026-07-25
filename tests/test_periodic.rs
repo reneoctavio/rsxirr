@@ -61,7 +61,7 @@ fn test_fv_vectorized_multi() {
     let pv = [-100.0, -150.0, -200.0];
     let pmt_at_beginning = [false, false, true];
 
-    let mut result = vec![0.0; 3];
+    let mut result = [0.0; 3];
 
     for i in 0..3 {
         result[i] = fv(rates[i], nper[i], -100.0, pv[i], pmt_at_beginning[i]);
@@ -74,8 +74,8 @@ fn test_fv_vectorized_multi() {
 
 #[rstest]
 fn test_fv_vectorized_iterable() {
-    let pmt_values = vec![-100.0, -200.0, -300.0];
-    let mut actual = vec![0.0; 3];
+    let pmt_values = [-100.0, -200.0, -300.0];
+    let mut actual = [0.0; 3];
 
     for (i, &pmt) in pmt_values.iter().enumerate() {
         actual[i] = fv(0.05 / 12.0, 10.0 * 12.0, pmt, -100.0, false);
@@ -649,4 +649,100 @@ fn test_cumipmt_works() {
 
     let result = cumipmt(0.09 / 12.0, 30.0 * 12.0, 125_000.0, 1.0, 1.0, false);
     assert_almost_eq!(result, -937.5, 1e-7);
+}
+
+// ------------ IRR with a guess ----------------
+
+/// A guess must not change *which* root is reported when it points at the root the
+/// guess-free call finds. This is the path an IRR series takes: each period seeds the
+/// next, so a drifting answer would compound across the series.
+#[rstest]
+#[case(&[-100.0, 39.0, 59.0, 55.0, 20.0])]
+#[case(&[-100.0, 100.0, 0.0, -7.0])]
+#[case(&[-40000.0, 5000.0, 8000.0, 12000.0, 30000.0])]
+#[case(&[-10.0, 2.0, 2.0, 2.0, 2.0])]
+// large magnitudes: |npv| < 1e-3 is unreachable here regardless of how exact the rate is
+#[case(&[
+    -1.44852555e+08,  1.28859998e+06,  1.27305118e+06,  1.25407349e+06,
+    1.24199669e+06,  1.22647792e+06,  1.21095552e+06,  1.19206955e+06,
+    1.17989821e+06,  1.16436524e+06,  1.14883185e+06,  1.12945217e+06,
+    1.11780102e+06,  1.10228427e+06,  1.08671783e+06,  1.06755759e+06,
+    1.05502327e+06,  1.03885451e+06,  1.02247003e+06,  1.00227444e+06,
+    9.88024873e+05
+])]
+#[case(&[
+    -5099701.25, -22503.796875, -22503.79296875, -22503.79296875, -20907.26171875,
+    -17899.7421875, -17899.7421875, -17899.7421875, -14660.69140625, -12447.80078125,
+    -12447.796875, -12018.1640625, -5991.81640625, -5991.81640625, -5991.81640625,
+    -2885.875, 1653.125, 1653.125, 1653.125, 8307.328125, 11110408.45703125
+])]
+fn test_irr_guess_agrees_with_no_guess(#[case] input: &[f64]) {
+    let expected = irr(input, None).unwrap();
+
+    // exact seed, and seeds off by a plausible period-over-period drift
+    for offset in [0.0, 1e-9, 0.005, -0.005, 0.05, -0.05] {
+        let rate = irr(input, Some(expected + offset)).unwrap();
+        assert_almost_eq!(rate, expected, 1e-7);
+    }
+}
+
+/// A guess nowhere near any root must still produce a genuine root, not NaN and not a
+/// rate that merely satisfies a loose absolute tolerance.
+#[rstest]
+#[case(&[-100.0, 39.0, 59.0, 55.0, 20.0])]
+#[case(&[-40000.0, 5000.0, 8000.0, 12000.0, 30000.0])]
+#[case(&[-10.0, 2.0, 2.0, 2.0, 2.0])]
+#[case(&[
+    -1.44852555e+08,  1.28859998e+06,  1.27305118e+06,  1.25407349e+06,
+    1.24199669e+06,  1.22647792e+06,  1.21095552e+06,  1.19206955e+06,
+    1.17989821e+06,  1.16436524e+06,  1.14883185e+06,  1.12945217e+06,
+    1.11780102e+06,  1.10228427e+06,  1.08671783e+06,  1.06755759e+06,
+    1.05502327e+06,  1.03885451e+06,  1.02247003e+06,  1.00227444e+06,
+    9.88024873e+05
+])]
+fn test_irr_absurd_guess_still_finds_a_root(#[case] input: &[f64]) {
+    let scale: f64 = input.iter().map(|v| v.abs()).sum();
+
+    for guess in [-0.999, -0.9, 0.0, 5.0, 100.0] {
+        let rate = irr(input, Some(guess)).unwrap();
+        assert!(rate.is_finite(), "guess {guess} produced {rate}");
+        // npv must vanish relative to the size of the cash flow
+        assert!(
+            npv(rate, input, Some(true)).abs() <= 1e-6 * scale,
+            "guess {guess} produced rate {rate}, npv {}",
+            npv(rate, input, Some(true))
+        );
+    }
+}
+
+/// Upstream https://github.com/Anexen/pyxirr/issues/69: an all-zero cash flow used to
+/// panic. Our `non_zero_range` guard fixes it differently than upstream's `unwrap_or(0)`,
+/// so pin the behavior here too.
+#[rstest]
+#[case(&[0.0, 0.0, 0.0, 0.0])]
+#[case(&[-0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])]
+#[case(&[0.0])]
+#[case(&[])]
+fn test_irr_all_zeros(#[case] input: &[f64]) {
+    assert!(irr(input, None).is_err(), "all-zero cash flow must be rejected, not panic");
+    assert!(irr(input, Some(0.1)).is_err(), "same with a guess");
+}
+
+/// Roots below -99.9% fall outside the `[-0.999, 100]` bracket, so they can only be found
+/// by the last-resort grid search. With the previous breakpoints (which started at -0.9)
+/// these returned NaN. See `benches/grid_fallback.rs` for the cost of the wider grid.
+#[rstest]
+#[case(&[-4002.0, 0.001, -0.001, 1e-6], -0.9995)]
+#[case(&[
+    -4002.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-60,
+], -0.9995507255384063)]
+fn test_irr_root_below_minus_999(#[case] input: &[f64], #[case] expected: f64) {
+    let rate = irr(input, None).unwrap();
+    assert!(rate.is_finite(), "expected a root near {expected}, got {rate}");
+    assert_almost_eq!(rate, expected, 1e-9);
+
+    // and it really is a root, relative to the size of the cash flow
+    let scale: f64 = input.iter().map(|v| v.abs()).sum();
+    assert!(npv(rate, input, Some(true)).abs() <= 1e-6 * scale);
 }

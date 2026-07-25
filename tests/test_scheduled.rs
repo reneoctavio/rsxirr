@@ -192,8 +192,8 @@ fn test_sum_xfv_eq_xnfv() {
     let xnfv_result = xnfv(rate, &dates, &amounts, None).unwrap();
 
     // Find min and max dates
-    let min_date = (*dates.iter().min().unwrap()).into();
-    let max_date = (*dates.iter().max().unwrap()).into();
+    let min_date = *dates.iter().min().unwrap();
+    let max_date = *dates.iter().max().unwrap();
 
     // Calculate sum of individual xfv values
     let sum_xfv_result: f64 = dates

@@ -48,3 +48,15 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bench]]
+name = "prefix_irr"
+harness = false
+
+[[bench]]
+name = "npv_kernel"
+harness = false
+
+[[bench]]
+name = "grid_fallback"
+harness = false

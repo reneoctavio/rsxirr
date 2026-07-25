@@ -71,6 +71,58 @@ where
     f64::NAN
 }
 
+/// Newton-Raphson seeded from a caller-supplied guess, for use *before* a bracket search.
+///
+/// Differs from [`newton_raphson_2`] in the two ways that matter for a warm start:
+///
+/// * the iteration cap is low — a good guess converges in a few steps, and a bad guess
+///   should fall through to the bracket search cheaply rather than burning 20 iterations;
+/// * convergence is judged on the step size relative to the rate, not on `|f(x)|` against
+///   an absolute tolerance. `newton_raphson_2` accepts only when `|npv| < 1e-3`, which is
+///   unreachable in f64 for cash flows in the billions no matter how exact the rate is.
+///
+/// Returns NaN if it does not converge, or if it walks outside `rate > -1`.
+pub fn newton_raphson_warm<Func>(start: f64, fd: &Func, max_iterations: u32) -> f64
+where
+    Func: Fn(f64) -> (f64, f64),
+{
+    const STEP_RTOL: f64 = 1e-12;
+
+    let mut x = start;
+
+    for _ in 0..max_iterations {
+        let (y0, y1) = fd(x);
+
+        if y0 == 0.0 {
+            return x;
+        }
+
+        // A flat or non-finite derivative gives no usable step.
+        if !y1.is_finite() || y1.abs() < f64::MIN_POSITIVE {
+            return f64::NAN;
+        }
+
+        let delta = y0 / y1;
+
+        if !delta.is_finite() {
+            return f64::NAN;
+        }
+
+        x -= delta;
+
+        // npv is undefined at or below -100%; let the bracket search handle it.
+        if x <= -1.0 {
+            return f64::NAN;
+        }
+
+        if delta.abs() <= STEP_RTOL * (1.0 + x.abs()) {
+            return x;
+        }
+    }
+
+    f64::NAN
+}
+
 pub fn newton_raphson_with_default_deriv<Func>(start: f64, f: Func) -> f64
 where
     Func: Fn(f64) -> f64,
