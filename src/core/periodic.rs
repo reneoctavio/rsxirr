@@ -1,5 +1,8 @@
+mod canonical;
 mod irr;
 mod npv;
+
+pub use canonical::canonical_irr;
 
 use super::{
     models::{InvalidPaymentsError, validate},
