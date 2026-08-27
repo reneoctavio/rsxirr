@@ -463,7 +463,7 @@ pub fn irr(values: &[f64], guess: Option<f64>) -> Result<f64, InvalidPaymentsErr
     }
 
     if values.len() == 3 {
-        return Ok(irr::irr_analytical_3(values));
+        return Ok(irr::irr_analytical_3(values, guess.unwrap_or(0.1)));
     }
 
     // A caller-supplied guess means "the root is near here". The dominant case is an IRR

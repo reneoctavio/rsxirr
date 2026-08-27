@@ -1,0 +1,4 @@
+# Rebuilt by generate_goldens.py on every run; only goldens.csv is the record.
+cases.fods
+cases.csv
+__pycache__/

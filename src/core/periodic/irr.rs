@@ -1,7 +1,5 @@
 use std::cmp::Ordering;
 
-use super::npv;
-
 #[inline(always)]
 pub(super) fn irr_analytical_2(values: &[f64]) -> f64 {
     // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 = 0  => multiply by (1 + r)
@@ -12,8 +10,12 @@ pub(super) fn irr_analytical_2(values: &[f64]) -> f64 {
     -values[1] / values[0] - 1.0
 }
 
+/// The rate of a three-movement flow, by the quadratic formula.
+///
+/// `guess` decides only which root comes back when there are two, the same
+/// thing it decides for longer flows where Newton starts from it.
 #[inline(always)]
-pub(super) fn irr_analytical_3(values: &[f64]) -> f64 {
+pub(super) fn irr_analytical_3(values: &[f64], guess: f64) -> f64 {
     // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 + cf[2]/(1+r)^2 = 0  => multiply by (1+r)^2
     // cf[0]*(1+r)^2 + cf[1]*(1+r) + cf[2] = 0  => quadratic equation
     // lets x = 1+r, a = cf[0], b = cf[1], c = cf[2]
@@ -55,12 +57,11 @@ pub(super) fn irr_analytical_3(values: &[f64]) -> f64 {
                 (Ordering::Greater, Ordering::Less | Ordering::Equal) => r1,
                 (Ordering::Less | Ordering::Equal, Ordering::Greater) => r2,
                 (Ordering::Greater, Ordering::Greater) => {
-                    // if both roots are non-negative,
-                    // choose the one that best approximates npv to zero
-                    let p1 = npv(r1, values, Some(true));
-                    let p2 = npv(r2, values, Some(true));
-
-                    if p1.abs() < p2.abs() {
+                    // Both are exact roots, so comparing how near their NPV
+                    // falls to zero compares rounding residue and nothing
+                    // else — it picked a root by noise. The guess is what
+                    // says which one was asked for.
+                    if (r1 - guess).abs() <= (r2 - guess).abs() {
                         r1
                     } else {
                         r2
