@@ -37,8 +37,8 @@ fn npv_autovec(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
         base
     };
 
-    let mut chunks = values.chunks_exact(AUTOVEC_CHUNK);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = values.as_chunks::<AUTOVEC_CHUNK>();
+    for chunk in chunks {
         let mut powers = [power; AUTOVEC_CHUNK];
         for i in 1..AUTOVEC_CHUNK {
             powers[i] = powers[i - 1] * base;
@@ -53,7 +53,7 @@ fn npv_autovec(base: f64, values: &[f64], start_from_zero: bool) -> f64 {
         power = powers[AUTOVEC_CHUNK - 1] * base;
     }
 
-    for &value in chunks.remainder() {
+    for &value in remainder {
         sum += value / power;
         power *= base;
     }
@@ -72,8 +72,8 @@ fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64
     let mut deriv = 0.0;
     let mut power = base;
 
-    let mut chunks = values.chunks_exact(AUTOVEC_CHUNK);
-    for (c, chunk) in (&mut chunks).enumerate() {
+    let (chunks, remainder) = values.as_chunks::<AUTOVEC_CHUNK>();
+    for (c, chunk) in chunks.iter().enumerate() {
         let mut powers = [power; AUTOVEC_CHUNK];
         for i in 1..AUTOVEC_CHUNK {
             powers[i] = powers[i - 1] * base;
@@ -93,8 +93,8 @@ fn npv_with_deriv_autovec(rate: f64, values: &[f64], start_index: usize) -> (f64
         power = powers[AUTOVEC_CHUNK - 1] * base;
     }
 
-    let done = values.len() - chunks.remainder().len();
-    for (i, &value) in chunks.remainder().iter().enumerate() {
+    let done = values.len() - remainder.len();
+    for (i, &value) in remainder.iter().enumerate() {
         let term = value / power;
         sum += term;
         deriv -= (start_index + done + i) as f64 * term * inv_base;
