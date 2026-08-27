@@ -17,7 +17,6 @@ use pyxirr::{irr, npv};
 /// The spreadsheet's own convergence tolerance is 0.00001%.
 const SPREADSHEET_TOLERANCE: f64 = 1e-7;
 
-
 struct Case {
     name: String,
     guess: Option<f64>,
@@ -169,10 +168,7 @@ fn the_guess_decides_which_root() {
 
     for (guess, expected) in [(None, 0.1), (Some(0.05), 0.1), (Some(0.5), 0.2)] {
         let rate = irr(&alternating, guess).unwrap();
-        assert!(
-            (rate - expected).abs() < 1e-7,
-            "guess {guess:?} returned {rate}, not {expected}"
-        );
+        assert!((rate - expected).abs() < 1e-7, "guess {guess:?} returned {rate}, not {expected}");
         assert!(npv(rate, &alternating, Some(true)).abs() < 1e-7);
     }
 }

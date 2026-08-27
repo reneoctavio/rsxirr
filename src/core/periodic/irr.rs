@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 
-
 #[inline(always)]
 pub(super) fn irr_analytical_2(values: &[f64]) -> f64 {
     // cf[0]/(1+r)^0 + cf[1]/(1+r)^1 = 0  => multiply by (1 + r)
