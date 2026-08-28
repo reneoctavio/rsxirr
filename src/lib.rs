@@ -10,7 +10,7 @@ mod conversions;
 mod core;
 
 pub use core::{
-    DateLike, DayCount, InvalidPaymentsError, cumipmt, cumprinc, days_between, fv, ipmt, irr, mirr,
-    nfv, nper, npv, pmt, ppmt, pv, rate, xfv, xirr, xnfv, xnpv, year_fraction,
+    DateLike, DayCount, InvalidPaymentsError, canonical_irr, cumipmt, cumprinc, days_between, fv,
+    ipmt, irr, mirr, nfv, nper, npv, pmt, ppmt, pv, rate, xfv, xirr, xnfv, xnpv, year_fraction,
     zero_crossing_points,
 };

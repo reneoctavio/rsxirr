@@ -25,6 +25,17 @@ jobs:
       - name: Clippy (aarch64, compiles the NEON kernels)
         run: cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
 
+  doc:
+    name: Doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # `[lib] doctest = false` keeps doctests out of `cargo test`, so the public
+      # examples in the docs compile and run only here. They do not touch the NPV
+      # kernels, so one run covers them -- no need for the tier matrix below.
+      - run: cargo test --doc
+
   test:
     name: Test (${{ matrix.tier.name }})
     runs-on: ubuntu-latest

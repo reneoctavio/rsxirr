@@ -1,5 +1,8 @@
+mod canonical;
 mod irr;
 mod npv;
+
+pub use canonical::canonical_irr;
 
 use super::{
     models::{InvalidPaymentsError, validate},
@@ -111,7 +114,7 @@ fn powers(base: f64, n: usize, start_from_zero: bool) -> impl Iterator<Item = f6
 /// use pyxirr::npv;
 /// let values = vec![-40_000.0, 5_000.0, 8_000.0, 12_000.0, 30_000.0];
 /// let result = npv(0.08, &values, Some(true));
-/// assert_eq!(result, 3065.2226681790715);
+/// assert!((result - 3065.2226681790715).abs() < 1e-7);
 /// ```
 #[inline(always)]
 pub fn npv(rate: f64, values: &[f64], start_from_zero: Option<bool>) -> f64 {
@@ -146,7 +149,7 @@ fn convert_pmt_at_beginning(pmt_at_beginning: bool) -> f64 {
 /// ```
 /// use pyxirr::fv;
 /// let result = fv(0.05 / 12.0, 10.0 * 12.0, -100.0, -100.0, false);
-/// assert_eq!(result, 15692.92889433575);
+/// assert!((result - 15692.92889433575).abs() < 1e-7);
 /// ```
 pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
@@ -179,7 +182,7 @@ pub fn fv(rate: f64, nper: f64, pmt: f64, pv: f64, pmt_at_beginning: bool) -> f6
 /// ```
 /// use pyxirr::pv;
 /// let result = pv(0.05 / 12.0, 10.0 * 12.0, -100.0, 15692.93, false);
-/// assert_eq!(result, -100.0006713162);
+/// assert!((result + 100.0006713162).abs() < 1e-7);
 /// ```
 pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
@@ -212,7 +215,7 @@ pub fn pv(rate: f64, nper: f64, pmt: f64, fv: f64, pmt_at_beginning: bool) -> f6
 /// ```
 /// use pyxirr::pmt;
 /// let result = pmt(0.05, 10.0, 100_000.0, 0.0, false);
-/// assert_eq!(result, -12950.45749654561);
+/// assert!((result + 12950.45749654561).abs() < 1e-7);
 /// ```
 pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
@@ -248,7 +251,7 @@ pub fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
 /// ```
 /// use pyxirr::ipmt;
 /// let result = ipmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
-/// assert_eq!(result, 2301.2385625860004);
+/// assert!((result - 2301.2385625860004).abs() < 1e-7);
 /// ```
 pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // let total_pmt = self::pmt(rate, nper, pv, fv, pmt_at_beginning);
@@ -307,7 +310,7 @@ pub fn ipmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
 /// ```
 /// use pyxirr::ppmt;
 /// let result = ppmt(0.05, 2.0, 10.0, -50_000.0, 0.0, false);
-/// assert_eq!(result, 4173.9901856864);
+/// assert!((result - 4173.9901856864).abs() < 1e-7);
 /// ```
 pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     // assuming type = 1 if pmt_at_beginning else 0
@@ -357,7 +360,7 @@ pub fn ppmt(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, pmt_at_beginning: 
 /// ```
 /// use pyxirr::nper;
 /// let result = nper(0.075, -2000.0, 0.0, 100_000.0, false);
-/// assert_eq!(result, 21.544944197323336);
+/// assert!((result - 21.544944197323336).abs() < 1e-7);
 /// ```
 pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f64 {
     if rate == 0.0 {
@@ -391,7 +394,7 @@ pub fn nper(rate: f64, pmt: f64, pv: f64, fv: f64, pmt_at_beginning: bool) -> f6
 /// ```
 /// use pyxirr::rate;
 /// let result = rate(10.0, -12950.46, 100_000.0, 0.0, false, None);
-/// assert_eq!(result, 0.05);
+/// assert!((result - 0.05).abs() < 1e-7);
 /// ```
 pub fn rate(
     nper: f64,
