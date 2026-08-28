@@ -137,18 +137,7 @@ fn is_invariant_under_scaling() {
 /// Over real monthly flows, every rate returned is a root inside the band.
 #[test]
 fn holds_over_real_project_flows() {
-    let raw = include_str!("spreadsheet/production_flows.json");
-    let flows: Vec<Vec<f64>> = raw
-        .split("],")
-        .map(|chunk| {
-            chunk
-                .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
-                .split(',')
-                .filter_map(|value| value.trim().parse::<f64>().ok())
-                .collect()
-        })
-        .filter(|flow: &Vec<f64>| flow.len() > 4)
-        .collect();
+    let flows = production_flows();
 
     let mut answered = 0;
     for flow in &flows {
@@ -163,6 +152,32 @@ fn holds_over_real_project_flows() {
         }
     }
     assert!(answered > 1_000, "only {answered} prefixes answered");
+}
+
+/// The recorded monthly flows of real projects.
+///
+/// Parsed by hand, so the counts are asserted: a format change that this
+/// parser silently drops would otherwise leave every test over the corpus
+/// passing on whatever fraction survived.
+fn production_flows() -> Vec<Vec<f64>> {
+    const FLOWS: usize = 60;
+    const AMOUNTS: usize = 9_540;
+
+    let flows: Vec<Vec<f64>> = include_str!("spreadsheet/production_flows.json")
+        .split("],")
+        .map(|chunk| {
+            chunk
+                .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
+                .split(',')
+                .map(|value| value.trim().parse::<f64>().expect("an amount"))
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(flows.len(), FLOWS, "the corpus lost flows in parsing");
+    assert_eq!(flows.iter().map(Vec::len).sum::<usize>(), AMOUNTS, "the corpus lost amounts");
+
+    flows
 }
 
 /// Deterministic flows, so a failure reproduces.
@@ -273,4 +288,33 @@ fn agrees_with_a_dense_scan_on_long_flows() {
     // Without these the test would pass on a residue check too, and prove
     // nothing about the reason it was replaced.
     assert!(residue_beyond_the_flow > 0, "no flow reached the range this guards");
+}
+
+/// Two roots close enough to sit between the same pair of sweep steps.
+///
+/// A sweep sees sign changes, and a pair of roots does not make one: the cell
+/// reads negative at both ends and looks empty. Here the roots are at
+/// x = 0.895 and x = 0.900, a sixth of a sweep step apart.
+#[test]
+fn finds_a_pair_of_roots_between_two_sweep_steps() {
+    let crowded = [-80.55, 179.5, -100.0];
+
+    let rate = canonical_irr(&crowded).unwrap().expect("a pair of roots is still a rate");
+
+    assert!((rate - 0.117_318).abs() < 1e-5, "{rate}");
+    assert_is_a_root(rate, &crowded);
+    // The other root of the pair, which the value climbs through.
+    assert_is_a_root(0.111_111, &crowded);
+}
+
+/// An amount that is not a number is an error, not an absent rate.
+///
+/// `NaN` compares false against every bound in the search, so without a check
+/// it reaches the end of the band and reports as a flow that never breaks
+/// even — a caller cannot tell corrupt input from a real answer.
+#[test]
+fn rejects_amounts_that_are_not_numbers() {
+    assert!(canonical_irr(&[-100.0, f64::NAN, 200.0]).is_err());
+    assert!(canonical_irr(&[-100.0, f64::INFINITY, 200.0]).is_err());
+    assert!(canonical_irr(&[-100.0, f64::NEG_INFINITY, 200.0]).is_err());
 }
