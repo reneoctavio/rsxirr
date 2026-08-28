@@ -19,8 +19,8 @@ const SWEEP_STEPS: u32 = 96;
 /// eight; the rest is headroom for a bracket that only bisects.
 const REFINEMENT_STEPS: u32 = 60;
 
-/// Relative tolerance for accepting a root, on the scale of the flow.
-const ROOT_TOLERANCE: f64 = 1e-8;
+/// Relative tolerance for accepting a root, as a displacement in `x`.
+const ROOT_TOLERANCE: f64 = 1e-9;
 
 /// `P(x) = Σ vᵢ·xⁱ`, by Horner.
 fn poly(values: &[f64], x: f64) -> f64 {
@@ -55,16 +55,16 @@ fn sign_changes(values: &[f64]) -> usize {
 
 /// Cauchy's bound: every positive root of `P` lies in `(0, bound]`.
 fn root_bound(values: &[f64]) -> f64 {
-    let leading = values
-        .iter()
-        .rposition(|coefficient| *coefficient != 0.0)
-        .map_or(1.0, |index| values[index].abs());
-
-    if leading == 0.0 {
+    let Some(degree) = values.iter().rposition(|coefficient| *coefficient != 0.0) else {
         return 1.0;
-    }
+    };
 
-    1.0 + values.iter().map(|coefficient| coefficient.abs()).fold(0.0_f64, f64::max) / leading
+    // The ratio is against the other coefficients: including the leading one
+    // would floor it at 1, and the bound at 2, whatever the flow looks like.
+    let leading = values[degree].abs();
+    let rest = values[..degree].iter().map(|coefficient| coefficient.abs()).fold(0.0_f64, f64::max);
+
+    1.0 + rest / leading
 }
 
 /// The root of `P` in `[low, high]`, which must hold a sign change.
@@ -125,14 +125,19 @@ fn refine(values: &[f64], low: f64, at_low: f64, high: f64, at_high: f64) -> f64
 
 /// The rate at `root`, where it is a return that the present value confirms.
 fn accept(values: &[f64], root: f64) -> Option<f64> {
-    let rate = 1.0 / root - 1.0;
-    let scale = values.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+    let (value, slope) = poly_and_slope(values, root);
 
     // Crossing upward in `x` is crossing downward in `r`.
-    let falls = poly_and_slope(values, root).1 > 0.0;
-    let zeroes = super::npv(rate, values, Some(true)).abs() <= scale * ROOT_TOLERANCE;
+    let falls = slope > 0.0;
 
-    (falls && zeroes).then_some(rate)
+    // `|P| / |P'|` is how far `root` sits from the root of `P`, and that is
+    // what confirms it. The residue on its own cannot: on a long flow at a
+    // negative rate the terms outgrow the flow by tens of orders of magnitude,
+    // so cancellation leaves a residue far above any amount in the flow while
+    // the root itself is located to the last bit `f64` carries.
+    let located = value.abs() <= ROOT_TOLERANCE * slope.abs() * root.abs();
+
+    (falls && located).then(|| 1.0 / root - 1.0)
 }
 
 /// The smallest rate per period at which a cash flow breaks even.
@@ -144,7 +149,7 @@ fn accept(values: &[f64], root: f64) -> Option<f64> {
 /// returns.
 ///
 /// Returns `None` when no such rate lies between -50% and 100% per period, or
-/// when the rate found cannot be confirmed to zero the present value.
+/// when the rate found cannot be confirmed to sit on a root.
 ///
 /// Prefer this where the rate decides something, such as a threshold crossing
 /// or a payment date. Prefer [`irr`](super::irr) where the rate is reported,
@@ -216,4 +221,51 @@ pub fn canonical_irr(values: &[f64]) -> Result<Option<f64>, InvalidPaymentsError
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bound narrows the window it is there to narrow.
+    ///
+    /// Taking the maximum over every coefficient rather than over the others
+    /// floors the ratio at 1 and the bound at 2, which is the band's own
+    /// ceiling — the window then never narrows for any flow at all.
+    #[test]
+    fn root_bound_narrows_when_the_last_amount_dominates() {
+        let ends_on_a_large_inflow = [-100.0, 10.0, 10.0, 5_000.0];
+
+        assert!(root_bound(&ends_on_a_large_inflow) < 2.0);
+    }
+
+    /// Nothing above the bound is a root.
+    #[test]
+    fn root_bound_holds_every_positive_root() {
+        let flows: [&[f64]; 4] = [
+            &[-100.0, 39.0, 59.0, 55.0, 20.0],
+            &[-100.0, 230.0, -132.0],
+            &[-100.0, 10.0, 10.0, 5_000.0],
+            &[-5_000.0, 10.0, 10.0, 100.0],
+        ];
+
+        for flow in flows {
+            let bound = root_bound(flow);
+            let mut previous = poly(flow, bound);
+
+            for step in 1..=1_000 {
+                let x = bound + f64::from(step) * bound / 100.0;
+                let current = poly(flow, x);
+                assert!(previous * current > 0.0, "a root past the bound {bound} of {flow:?}");
+                previous = current;
+            }
+        }
+    }
+
+    /// A flow with no amount at all has no root to bound.
+    #[test]
+    fn root_bound_survives_an_empty_flow() {
+        assert_eq!(root_bound(&[]), 1.0);
+        assert_eq!(root_bound(&[0.0, 0.0]), 1.0);
+    }
 }
