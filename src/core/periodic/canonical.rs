@@ -16,6 +16,11 @@ const MIN_RATE: f64 = -0.5;
 const X_FLOOR: f64 = 1.0 / (1.0 + MAX_RATE);
 const X_CEILING: f64 = 1.0 / (1.0 + MIN_RATE);
 
+// `root_bound` never returns less than 1, so the window `(X_FLOOR, bound]` is
+// never empty and the sweep always has somewhere to look. A floor at or above
+// 1 would break that, and this is where it would be noticed.
+const _: () = assert!(X_FLOOR < 1.0);
+
 /// Steps of the downward sweep that brackets a root, where a flow changes sign
 /// often enough that a root can hide anywhere in the band.
 const SWEEP_STEPS: u32 = 96;
@@ -264,9 +269,6 @@ pub fn canonical_irr(values: &[f64]) -> Result<Option<f64>, InvalidPaymentsError
     // Under `x = 1/(1+r)` the present value is a polynomial, which stays
     // evaluable where dividing by `(1+r)ⁱ` does not.
     let bound = root_bound(values).min(X_CEILING);
-    if bound <= X_FLOOR {
-        return Ok(None);
-    }
 
     // One sign change admits one positive root, by Descartes' rule, so the
     // band either holds that root or no sweep would have found it.
